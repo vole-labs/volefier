@@ -1,0 +1,73 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# Bootstrapped training data (regenerate with bootstrap.py)
+*_train_data_ntree64.csv
+data/
+
+# model/ holds large local-only binaries + datasets (13 GB); never commit them.
+# model/README.md is the checked-in index of what each file is.
+model/*
+!model/README.md
+external/install/
+external/*/build/
+
+# --- release hygiene: never publish scratch notes, internal results, or infra ---
+/rebuttal.txt
+/problem.txt
+/commands.txt
+/bench_instruction.md
+/ACCURACY.md
+/IP_DEFER_RESULTS.md
+/setup.sh
+/run_alice.sh
+/run_bob.sh
+*.calib
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+# heavy / third-party / unpublished (not part of the library)
+/references/
+/manuscript/
+/attack/
+/build-*/

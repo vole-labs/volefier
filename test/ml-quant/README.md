@@ -23,11 +23,12 @@ below covers all of them, calling out the per-model differences inline.
 
 ## 1. Build
 
-The emp dependencies are **git submodules** built in-tree (see the [root README](../../README.md)) —
-no global installs. Prereqs: OpenSSL, CMake ≥ 3.13, a C++20 compiler with AES-NI/AVX.
+The ZK back-end ([vole-zk](https://github.com/vole-labs/vole-zk)) is a **git submodule** built in-tree
+(see the [root README](../../README.md)) — no global installs. Prereqs: OpenSSL, CMake ≥ 3.21, a C++20
+compiler with AES-NI/AVX.
 
 ```bash
-git submodule update --init && tools/build_deps.sh        # once per checkout / dep bump
+git submodule update --init --recursive && tools/build_deps.sh   # once per checkout / dep bump
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/external/install"
 cmake --build build -j --target test_ml-quant_quant_gpt2_prove       # GPT-2 (transformer)
 cmake --build build -j --target test_ml-quant_quant_bert_sym_prove   # BERT sym-int12

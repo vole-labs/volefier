@@ -1,12 +1,3 @@
-[submodule "external/emp-tool"]
-	path = external/emp-tool
-	url = https://github.com/carlweng/emp-tool.git
-	branch = master
-[submodule "external/emp-ot"]
-	path = external/emp-ot
-	url = https://github.com/carlweng/emp-ot.git
-	branch = main
-[submodule "external/emp-zk"]
-	path = external/emp-zk
-	url = https://github.com/carlweng/emp-zk.git
-	branch = main
+[submodule "external/vole-zk"]
+	path = external/vole-zk
+	url = https://github.com/vole-labs/vole-zk.git

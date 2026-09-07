@@ -22,11 +22,11 @@ below covers all three, calling out per-model differences inline.
 
 ## 1. Build
 
-Prereqs: the [emp-toolkit](https://github.com/emp-toolkit) forks (`emp-zk`, `emp-ot`, `emp-tool`)
-installed, OpenSSL, CMake ≥ 3.13, a C++20 compiler with AES-NI/AVX.
+Prereqs: the [vole-zk](https://github.com/vole-labs/vole-zk) submodule built into `external/install`
+(see the [root README](../../README.md)), OpenSSL, CMake ≥ 3.21, a C++20 compiler with AES-NI/AVX.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/external/install"
 cmake --build build -j --target test_ml-fixed_gpt2_prove    # GPT-2
 cmake --build build -j --target test_ml-fixed_bert_prove    # BERT
 cmake --build build -j --target test_ml-fixed_onnx_infer    # CNN / MLP

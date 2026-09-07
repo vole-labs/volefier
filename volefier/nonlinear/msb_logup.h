@@ -58,7 +58,7 @@ public:
 
     // decompose x
     if(party == ALICE) {
-      uint64_t val = static_cast<uint64_t>(x.value>>64);
+      uint64_t val = static_cast<uint64_t>(VAL(x.value));
       uint64_t msb_raw = val >> (fp_bit_sz - 1);
 
       uint64_t w_raw = (uint64_t)(bool)val;
@@ -138,7 +138,7 @@ public:
     if(party == ALICE) {
       bool *bits = new bool[fp_bit_sz];
       for(std::size_t k = 0; k < num; ++k) {
-        uint64_t val = static_cast<uint64_t>(x[k].value>>64);
+        uint64_t val = static_cast<uint64_t>(VAL(x[k].value));
         uint64_t msb_raw = val >> (fp_bit_sz - 1);
         
         uint64_t w_raw = (uint64_t)(bool)val;
@@ -215,7 +215,7 @@ public:
   void check_nonzero(IntFp x, IntFp y){
     IntFp u;
     if (party == ALICE){
-      uint64_t x_raw = static_cast<uint64_t>(x.value>>64);
+      uint64_t x_raw = static_cast<uint64_t>(VAL(x.value));
       uint64_t u_raw = inv_mod(x_raw);
       u = IntFp(u_raw, ALICE);
     } else {

@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
         int faults = 0;
         for (int i = 0; i < dim; i++) {
             uint64_t expect = ((witness[i] >> 60) == 0) ? witness[i] : 0;
-            uint64_t got    = (uint64_t)HIGH64(y[i].value);
+            uint64_t got    = (uint64_t)VAL(y[i].value);
             if (expect != got) {
                 if (faults < 3)
                     cout << "fault i=" << i

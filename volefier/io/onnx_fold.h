@@ -301,6 +301,36 @@ inline bool fold_eval(const OnnxNode &n, const std::map<std::string, HT> &V, HT 
     res.dt = x.dt;
     return true;
   }
+  if (op == "GatherElements") { // out[i] = data[i with axis-coordinate replaced by idx[i]]
+    const HT &x = in(0), &ix = in(1);
+    const int nd = (int)x.shape.size();
+    if (nd == 0 || (int)ix.shape.size() != nd || x.v.empty()) return false;
+    auto ait = n.attr.find("axis"); // a scalar attribute (.i), which ai() (lists only) does not read
+    const int ax = norm_axis(ait != n.attr.end() ? (int)ait->second.i : 0, nd);
+    std::vector<int64_t> xst(nd), ist(nd);
+    for (int i = nd - 1, sx = 1, si = 1; i >= 0; --i) {
+      xst[i] = sx; sx *= (int)x.shape[i];
+      ist[i] = si; si *= (int)ix.shape[i];
+    }
+    res.dt = x.dt;
+    res.shape = ix.shape;
+    res.v.assign(ix.numel(), 0);
+    for (int64_t k = 0; k < ix.numel(); ++k) {
+      int64_t rem = k, off = 0;
+      for (int i = 0; i < nd; ++i) {
+        int64_t c = rem / ist[i];
+        rem %= ist[i];
+        if (i == ax) {
+          c = (int64_t)ix.v[k];
+          if (c < 0) c += x.shape[i];
+          if (c < 0 || c >= x.shape[i]) return false;
+        }
+        off += c * xst[i];
+      }
+      res.v[k] = x.v[off];
+    }
+    return true;
+  }
   if (op == "Range") {
     double s = in(0).v[0], lim = in(1).v[0], d = in(2).v[0];
     res.dt = in(0).dt;

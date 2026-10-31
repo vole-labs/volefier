@@ -1720,10 +1720,11 @@ private:
       std::vector<IntFp> y(A.size());
       std::vector<int64_t> r;
       if (hr) r.resize(A.size());
-      const int64_t MCLAMP =
-          (int64_t)1 << (P +
-                         8); // GPT-2 additive mask is -inf -> clamp to ~-256 (real) so the softmax
-                             // exp-key stays in [0,512) at ANY P (else the mask weakens at high P)
+      // GPT-2 additive mask is -inf -> clamp to ~-256 REAL so the softmax exp-key stays in [0,512)
+      // at ANY P (else the mask weakens at high P).  The constant is quantized at the activation's
+      // scale sa, so the clamp is 256/sa in those units: 2^(P+8) when sa = 2^-P, but the SYM_BITS
+      // per-tensor scales are not 2^-P and a fixed 2^(P+8) there pushed the exp key out of range.
+      const int64_t MCLAMP = (int64_t)std::min(std::llround(256.0 / sa), (long long)1 << 40);
       // Quantize the constant + build its public labels ONCE per (constant @ scale), reused across
       // the broadcast (heads) AND across layers -- the GPT-2 causal mask is identical every layer,
       // so this turns 38M per-element float-clamp + pub_label into one nb-sized precompute.

@@ -63,8 +63,9 @@ python3 tools/fullfold_onnx.py  model/gpt2-12-quarot.onnx  model/gpt2-folded-s51
 ### BERT — fp32
 
 ```bash
-python3 tools/export_bert.py 512                                    # -> model/bert512_fp32.onnx
-python3 tools/export_bert.py 512 textattack/bert-base-uncased-SST-2 # fine-tuned head (for real accuracy)
+B="BERT_FP32=model/bert512_fp32.onnx BERT_QDQ=model/bert512_qdq.onnx"
+env $B python3 tools/quantize_export/export_bert.py 512                                    # -> model/bert512_fp32.onnx
+env $B python3 tools/quantize_export/export_bert.py 512 textattack/bert-base-uncased-SST-2 # fine-tuned head (for real accuracy)
 ```
 - `bert512_fp32.onnx` → quantized internally to symmetric int12 via `sym_quant_act` + a static calib.
 - BERT needs **no QuaRot rotation** — it runs on plain symmetric int12.

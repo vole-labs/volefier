@@ -120,8 +120,9 @@ int main(int argc,char**argv){
     // classification head: proven argmax over the (few) class logits (skip with NO_ARGMAX to isolate forward soundness)
     // SYM path: the classifier logits are RAW matmul accumulators (scale s_x*s_w, un-requanted since
     // `logits` is a graph output -> post-op sym-quant skipped), so |logit| ~ 2^34 (768-term int sum).
-    // argmax's assert_le range-checks (sel - x_i) in operand_bits+1 bits, so use a wide bound (48).
-    const int ARGBITS=getenv("ARGBITS")?atoi(getenv("ARGBITS")):48;
+    // argmax's assert_le range-checks (sel - x_i) in operand_bits+1 bits, so use a wide bound (47:
+    // the most a 16-bit range table can soundly check below the 61-bit field; 48 is refused).
+    const int ARGBITS=getenv("ARGBITS")?atoi(getenv("ARGBITS")):47;
     int cls=-1; if(!getenv("NO_ARGMAX")){ IntFp idx=cmp.argmax(out,ARGBITS); cls=(int)idx.reveal(); } else for(auto&v:out) v.reveal();
     LAP("argmax");
     rclu.Teardown(); expt.Teardown(); gtab.Teardown(); ttab.Teardown(); for(auto t:fused_tabs)t->Teardown(); divr.destroy(); qi.destroy(); LAP("lookup-teardown"); finalize_zk_arith(); LAP("finalize_zk_arith");

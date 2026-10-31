@@ -8,7 +8,6 @@
 #include "volefier/zk-ram/logup_keyvalue.h"
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -218,10 +217,6 @@ public:
         sum += std::exp(-static_cast<double>(mref - rlog[i]) * isc);
       shift_v = static_cast<int64_t>(llround(std::log(sum) / isc));
       if (shift_v < 0) shift_v = 0;
-      // negative test only: a cheating prover offsets the shift, scaling the whole row by
-      // exp(-k * isc); the normalization check must reject it once that exceeds the slack
-      static const int64_t cheat = getenv("LSE_CHEAT_SHIFT") ? atoll(getenv("LSE_CHEAT_SHIFT")) : 0;
-      shift_v += cheat;
     }
     IntFp shift(static_cast<uint64_t>(shift_v), ALICE); // committed LSE shift witness (>= 0)
     std::vector<IntFp> keys(L);

@@ -230,24 +230,6 @@ public:
         fprintf(stderr, "]: %s\n", e.what());
         throw;
       }
-      // debug: DUMP_DIR=<dir> makes the prover write every op output it holds (its own witness,
-      // decoded to signed ints at 2^-P, extra LSE bits noted) for comparison against a float run
-      if (party == ALICE && getenv("DUMP_DIR")) {
-        for (const auto &o : n.output) {
-          if (!act_.count(o)) continue;
-          char path[512];
-          snprintf(path, sizeof path, "%s/%04d.txt", getenv("DUMP_DIR"), ni);
-          FILE *f = fopen(path, "a");
-          if (!f) continue;
-          fprintf(f, "%s %s %d", op.c_str(), o.c_str(), xbits(o));
-          for (int sd : shp_.count(o) ? shp_.at(o) : std::vector<int>()) fprintf(f, " %d", sd);
-          fprintf(f, "\n");
-          for (const auto &v : act_.at(o))
-            fprintf(f, "%lld ", (long long)FixedInfer::decode_signed((uint64_t)VAL(v.value)));
-          fprintf(f, "\n");
-          fclose(f);
-        }
-      }
       if (mover && !n.input.empty() && xbits_.count(n.input[0]))
         for (const auto &o : n.output) xbits_[o] = xbits_.at(n.input[0]);
       if (stream)

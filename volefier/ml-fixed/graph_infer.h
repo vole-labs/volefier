@@ -46,6 +46,9 @@ public:
   int64_t gelu_off = 0, sig_off = 0, tanh_off = 0;
   std::size_t score_bits = 16;
   bool lse_softmax = false; // DeepProve LogSumExp softmax (no max_value, no division)
+  int lse_extra_bits = 0;   // LSE: probabilities at 2^-(P+lse_extra_bits) (exp_tab built to match);
+                            // the extra bits are dropped by the consuming attn@V MatMul's requant
+  double lse_max_slack = 0; // LSE: refuse rows whose normalization slack exceeds this (0 = off)
   std::vector<std::string> ops_run;
 
   FixedGraphInfer(FixedInfer *qi_, CompareLU *cmp_, int party_, int P_, std::size_t ab = 30)
@@ -142,6 +145,14 @@ public:
       ops_run.push_back(n.op_type);
       const std::string &op = n.op_type;
       if (!n.output.empty()) last_out_ = n.output[0];
+      // tensors carrying extra fractional bits (the LSE softmax output) flow unchanged through
+      // pure data movement and into a batched MatMul, which absorbs them in its requant; any
+      // other consumer gets them requantized to 2^-P first.
+      static const std::set<std::string> movers = {"Transpose", "Flatten", "Reshape", "Dropout",
+                                                   "Identity", "Cast", "Unsqueeze", "Squeeze"};
+      const bool mover = movers.count(op) > 0;
+      if (!mover && op != "MatMul")
+        for (const auto &in : n.input) settle(in);
       // commit any SMALL folded-constant input that flows into a compute op (mask/glue
       // constants); large weights are read directly from the initializer by their handlers.
       for (const auto &in : n.input)
@@ -219,6 +230,26 @@ public:
         fprintf(stderr, "]: %s\n", e.what());
         throw;
       }
+      // debug: DUMP_DIR=<dir> makes the prover write every op output it holds (its own witness,
+      // decoded to signed ints at 2^-P, extra LSE bits noted) for comparison against a float run
+      if (party == ALICE && getenv("DUMP_DIR")) {
+        for (const auto &o : n.output) {
+          if (!act_.count(o)) continue;
+          char path[512];
+          snprintf(path, sizeof path, "%s/%04d.txt", getenv("DUMP_DIR"), ni);
+          FILE *f = fopen(path, "a");
+          if (!f) continue;
+          fprintf(f, "%s %s %d", op.c_str(), o.c_str(), xbits(o));
+          for (int sd : shp_.count(o) ? shp_.at(o) : std::vector<int>()) fprintf(f, " %d", sd);
+          fprintf(f, "\n");
+          for (const auto &v : act_.at(o))
+            fprintf(f, "%lld ", (long long)FixedInfer::decode_signed((uint64_t)VAL(v.value)));
+          fprintf(f, "\n");
+          fclose(f);
+        }
+      }
+      if (mover && !n.input.empty() && xbits_.count(n.input[0]))
+        for (const auto &o : n.output) xbits_[o] = xbits_.at(n.input[0]);
       if (stream)
         for (const auto &in : n.input)
           if (!in.empty() && last_use[in] == ni && !keep.count(in) && !ctab_.count(in) &&
@@ -226,6 +257,7 @@ public:
             act_.erase(in);
             ref_.erase(in);
             shp_.erase(in);
+            xbits_.erase(in);
             if (free_init)
               const_cast<OnnxGraph &>(*g_).initializer.erase(
                   in); // free the fp32 weight (graph is caller-owned non-const)
@@ -250,6 +282,8 @@ private:
   std::map<std::string, std::pair<int, int>> ctab_dim_; // name -> (V, D)
   std::map<std::string, std::string> wteT_src_; // transposed-handle -> underlying table name
   std::map<std::string, std::vector<IntFp>> act_;
+  std::map<std::string, int> xbits_; // tensors carrying extra fractional bits (see xbits())
+  bool lse_slack_reported_ = false;
   std::map<std::string, std::vector<int>> shp_;
   std::map<std::string, std::vector<int64_t>> ref_;
 
@@ -271,6 +305,16 @@ private:
   }
   int64_t qz(double v) {
     return (int64_t)llround(v * (double)(1LL << P));
+  }
+  // A folded constant flowing into an activation op (mask / glue), quantized like qz but clamped
+  // to half the exp-table domain (2^(score_bits-1), real 256 at the default score_bits = P+9) so a
+  // mask's -inf / finfo.min stays representable and inside the table.  A fixed 2^15 was real 256
+  // at P=7 but only real 8 at P=12, where exp(-8) would leak attention to future tokens.
+  int64_t qz_const(double v) const {
+    const int64_t CL = (int64_t)1 << (score_bits - 1);
+    v *= (double)(1LL << P);
+    if (!std::isfinite(v)) return v < 0 ? -CL : CL;
+    return (int64_t)std::max(-(double)CL, std::min((double)CL, (double)llround(v)));
   }
 
   // ---- Gemm: y = x @ W^T + b ----
@@ -334,6 +378,8 @@ private:
     if (hr) ref_[n.output[0]] = std::move(r);
   }
   void matmul(const OnnxNode &n) {
+    if (wteT_src_.count(n.input[1]) || g_->initializer.count(n.input[1]))
+      for (const auto &in : n.input) settle(in);
     if (wteT_src_.count(n.input[1])) {
       matmul_wte(n);
       return;
@@ -363,7 +409,8 @@ private:
     std::vector<IntFp> raw;
     qi->ipp->matmul_attn(raw, A.data(), Bv.data(), G, M, N, K, Bb, qi->mat_threads);
     std::vector<IntFp> out;
-    qi->requant_cm(out, raw, 1, qi->precision); // 2^2P -> 2^P
+    const int X = xbits(n.input[0]) + xbits(n.input[1]); // e.g. LSE probs @ V
+    qi->requant_cm(out, raw, 1, qi->precision + X);     // 2^-(2P+X) -> 2^-P
     std::vector<int> ns;
     if (sA.size() >= 3) {
       ns = sA;
@@ -377,7 +424,7 @@ private:
     if (party == ALICE && ref_.count(n.input[0]) && ref_.count(n.input[1])) {
       const auto &ar = ref_.at(n.input[0]), &br = ref_.at(n.input[1]);
       std::vector<int64_t> r((size_t)G * M * N);
-      const int64_t D = 1LL << P;
+      const int64_t D = 1LL << (P + X);
       for (int g = 0; g < G; ++g)
         for (int m = 0; m < M; ++m)
           for (int j = 0; j < N; ++j) {
@@ -850,7 +897,7 @@ private:
     if (g_->initializer.count(n.input[1])) {
       const OnnxTensor &T = g_->initializer.at(n.input[1]);
       std::vector<int64_t> q(T.data.size());
-      for (size_t i = 0; i < T.data.size(); ++i) q[i] = qz(T.data[i]);
+      for (size_t i = 0; i < T.data.size(); ++i) q[i] = qz_const(T.data[i]);
       qi->commit_vec(B, q);
       Br = q;
       sB = {(int)q.size()};
@@ -896,6 +943,14 @@ private:
     const int d = xs.back(), rows = prod(xs) / d;
     FixedSoftmax sm(qi, cmp, exp_tab, divr, P, score_bits);
     sm.lse = lse_softmax;
+    const int X = lse_softmax ? lse_extra_bits : 0;
+    sm.out_bits = P + X;
+    sm.max_slack = lse_softmax ? lse_max_slack : 0;
+    if (lse_softmax && party == ALICE && !lse_slack_reported_) {
+      lse_slack_reported_ = true;
+      printf("[1] LSE softmax: probs at 2^-%d, normalization slack %.4f%% for rows of %d\n", P + X,
+             100.0 * sm.lse_slack(d), d);
+    }
     std::vector<IntFp> y(x.size());
     for (int ri = 0; ri < rows; ++ri) {
       std::vector<IntFp> row(x.begin() + (int64_t)ri * d, x.begin() + (int64_t)(ri + 1) * d);
@@ -904,6 +959,23 @@ private:
     }
     act_[n.output[0]] = std::move(y);
     shp_[n.output[0]] = xs; // table/exp-based; exact ref omitted
+    if (X) xbits_[n.output[0]] = X;
+  }
+
+  // extra fractional bits a tensor carries beyond 2^-P (0 for all but the LSE softmax output)
+  int xbits(const std::string &nm) const {
+    auto it = xbits_.find(nm);
+    return it == xbits_.end() ? 0 : it->second;
+  }
+  // bring a tensor carrying extra bits back to 2^-P in place (non-MatMul consumers)
+  void settle(const std::string &nm) {
+    auto it = xbits_.find(nm);
+    if (it == xbits_.end()) return;
+    std::vector<IntFp> &v = act_.at(nm);
+    std::vector<IntFp> out;
+    qi->requant_cm(out, v, 1, it->second);
+    v = std::move(out);
+    xbits_.erase(it);
   }
 
   // ---- LayerNormalization (over last dim) ----
@@ -992,14 +1064,11 @@ private:
     if (act_.count(nm)) return act_.at(nm);
     const OnnxTensor &t = g_->initializer.at(nm);
     size_t cnt = std::max(t.data.size(), t.i64.size());
-    const int64_t CL = (int64_t)1 << 15;
+    const int64_t CL = (int64_t)1 << (score_bits - 1);
     std::vector<int64_t> q(cnt);
-    for (size_t i = 0; i < cnt; ++i) {
-      double v = t.dtype == 1 ? (double)t.data[i] * (double)(1LL << P) : (double)t.i64[i];
-      q[i] = std::isfinite(v)
-                 ? (int64_t)std::max(-(double)CL, std::min((double)CL, (double)llround(v)))
-                 : (v < 0 ? -CL : CL);
-    }
+    for (size_t i = 0; i < cnt; ++i)
+      q[i] = t.dtype == 1 ? qz_const(t.data[i])
+                          : std::max(-CL, std::min(CL, (int64_t)t.i64[i]));
     std::vector<IntFp> c;
     qi->commit_vec(c, q);
     shp_[nm] = std::vector<int>(t.dims.begin(), t.dims.end());

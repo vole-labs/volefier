@@ -8,6 +8,7 @@
 #include "volefier/zk-ram/logup_keyvalue.h"
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 using namespace emp;
@@ -19,6 +20,45 @@ using namespace emp;
 // LayerNorm, batched single-head attention, causal masking by prefix.
 
 using Mat = std::vector<std::vector<IntFp>>; // row-major committed matrix
+
+// ---------------------------------------------------------------------------
+// Whole-sequence matmul:  C = A @ B with A [M x K] and B [K x N] row-major, proven by ONE
+// Freivalds check (commit C, then a single random-fold inner product).  Used by the batched
+// forward (forward_seq) and the batched frozen-weight backward (LoRABlockBackward).
+static inline void mm_seq(const FixedInfer *qi, std::vector<IntFp> &C, const std::vector<IntFp> &A,
+                          const std::vector<IntFp> &B, std::size_t M, std::size_t N, std::size_t K) {
+  qi->ipp->matmul_attn_freivalds(C, A.data(), B.data(), 1, (int)M, (int)N, (int)K, false,
+                                 qi->mat_threads);
+}
+
+static inline std::vector<IntFp> flat_of(const Mat &X) {
+  std::vector<IntFp> f;
+  f.reserve(X.size() * (X.empty() ? 0 : X[0].size()));
+  for (const auto &row : X) f.insert(f.end(), row.begin(), row.end());
+  return f;
+}
+
+static inline std::vector<IntFp> transpose_of(const std::vector<IntFp> &X, std::size_t R,
+                                              std::size_t C) {
+  std::vector<IntFp> T(R * C);
+  for (std::size_t r = 0; r < R; ++r)
+    for (std::size_t c = 0; c < C; ++c) T[c * R + r] = X[r * C + c];
+  return T;
+}
+
+// Whole-sequence dense layer:  Y[t] = requant(W @ X[t]) + b for every row t of X (flat,
+// rows x din), W dout x din.  One mm_seq; the committed values equal dense_layer's per row.
+static inline void dense_seq(const FixedInfer *qi, Mat &Y, const Mat &W,
+                             const std::vector<IntFp> &b, const std::vector<IntFp> &X,
+                             std::size_t rows) {
+  const std::size_t dout = W.size(), din = dout ? W[0].size() : 0;
+  std::vector<IntFp> raw, rq;
+  mm_seq(qi, raw, X, transpose_of(flat_of(W), dout, din), rows, dout, din);
+  qi->requant_cm(rq, raw, qi->wc, qi->precision);
+  Y.assign(rows, std::vector<IntFp>(dout));
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t j = 0; j < dout; ++j) Y[t][j] = rq[t * dout + j] + b[j];
+}
 
 // ---------------------------------------------------------------------------
 // Token embedding: row id -> d-dim committed row, plus a positional embedding.
@@ -80,6 +120,10 @@ public:
                  uint64_t qinv_)
       : qi(qi_), sm(sm_), P(P_), d(d_), h(h_), dh(d_ / h_), qinv(qinv_) {}
 
+  // Extra bits of the cached probabilities beyond 2^-P (an LSE softmax with out_bits > P).
+  // Only forward_seq (and LoRABlockBackward) handle it.
+  int prob_extra() const { return (sm->lse && sm->out_bits > P) ? sm->out_bits - P : 0; }
+
   // Project x (length d) by W (d x d) + b -> length d, requant to scale 2^-P.
   std::vector<IntFp> proj(const Mat &W, const std::vector<IntFp> &b, const std::vector<IntFp> &x) {
     std::vector<IntFp> y;
@@ -91,6 +135,7 @@ public:
   void forward(Mat &out, const Mat &H, const Mat &Wq, const std::vector<IntFp> &bq, const Mat &Wk,
                const std::vector<IntFp> &bk, const Mat &Wv, const std::vector<IntFp> &bv,
                const Mat &Wo, const std::vector<IntFp> &bo) {
+    if (prob_extra()) throw std::runtime_error("FixedAttention::forward: LSE out_bits > P needs forward_seq");
     const std::size_t s = H.size();
     Mat Q(s), K(s), V(s);
     for (std::size_t i = 0; i < s; ++i) {
@@ -150,6 +195,77 @@ public:
     }
   }
 
+  // forward() with every matmul over the whole sequence: the Q/K/V and output projections are one
+  // mm_seq each, and the attention core one Q_h @ K_h^T and one probs_h @ V_h per head, instead of
+  // a dense_layer per token and a dot_ip per (query, head, key).  The committed values and the
+  // cache are the same as forward()'s.
+  void forward_seq(Mat &out, const Mat &H, const Mat &Wq, const std::vector<IntFp> &bq,
+                   const Mat &Wk, const std::vector<IntFp> &bk, const Mat &Wv,
+                   const std::vector<IntFp> &bv, const Mat &Wo, const std::vector<IntFp> &bo) {
+    const std::size_t s = H.size();
+    const IntFp zero(static_cast<uint64_t>(0), PUBLIC);
+    const std::vector<IntFp> Hf = flat_of(H);
+    Mat Q, K, V;
+    dense_seq(qi, Q, Wq, bq, Hf, s);
+    dense_seq(qi, K, Wk, bk, Hf, s);
+    dense_seq(qi, V, Wv, bv, Hf, s);
+
+    // causal scores of every head (j <= i), then ONE fused 2P + 1/sqrt(dh) requant for all
+    std::vector<IntFp> raw, causal, scaled;
+    causal.reserve(h * s * (s + 1) / 2);
+    for (std::size_t hh = 0; hh < h; ++hh) {
+      const std::size_t off = hh * dh;
+      std::vector<IntFp> Qh(s * dh), KhT(dh * s);
+      for (std::size_t i = 0; i < s; ++i)
+        for (std::size_t k = 0; k < dh; ++k) {
+          Qh[i * dh + k] = Q[i][off + k];
+          KhT[k * s + i] = K[i][off + k];
+        }
+      mm_seq(qi, raw, Qh, KhT, s, s, dh);
+      for (std::size_t i = 0; i < s; ++i)
+        for (std::size_t j = 0; j <= i; ++j) causal.push_back(raw[i * s + j]);
+    }
+    qi->requant_cm(scaled, causal, qinv, 2 * (std::size_t)P);
+    if (save_intermediates) { cache["scores"].assign(s * h, {}); cache["probs"].assign(s * h, {}); }
+
+    // softmax per (query, head) row (probs at 2^-(P+X)), then ctx_h = probs_h @ V_h, brought
+    // to 2^-2P (the rest of the requant is deferred to the output projection)
+    const std::size_t X = static_cast<std::size_t>(prob_extra());
+    Mat ctx(s, std::vector<IntFp>(d));
+    for (std::size_t hh = 0, base = 0; hh < h; ++hh) {
+      const std::size_t off = hh * dh;
+      std::vector<IntFp> Pr(s * s, zero), Vh(s * dh);
+      for (std::size_t i = 0; i < s; base += i + 1, ++i) {
+        std::vector<IntFp> row(scaled.begin() + base, scaled.begin() + base + i + 1);
+        std::vector<IntFp> probs = sm->forward(row);
+        for (std::size_t j = 0; j <= i; ++j) Pr[i * s + j] = probs[j];
+        for (std::size_t k = 0; k < dh; ++k) Vh[i * dh + k] = V[i][off + k];
+        if (save_intermediates) {
+          cache["probs"][i * h + hh] = std::move(probs);
+          cache["scores"][i * h + hh] = std::move(row);
+        }
+      }
+      mm_seq(qi, raw, Pr, Vh, s, dh, s);
+      if (X) qi->requant_cm(raw, std::vector<IntFp>(raw), 1, X);
+      for (std::size_t i = 0; i < s; ++i)
+        for (std::size_t k = 0; k < dh; ++k) ctx[i][off + k] = raw[i * dh + k];
+    }
+
+    // output projection on the 2^-2P ctx, truncating 2P at once (as in forward())
+    std::vector<IntFp> tr;
+    mm_seq(qi, raw, flat_of(ctx), transpose_of(flat_of(Wo), d, d), s, d, d);
+    qi->requant_cm(tr, raw, qi->wc, 2 * (std::size_t)P);
+    out.assign(s, std::vector<IntFp>(d));
+    for (std::size_t i = 0; i < s; ++i)
+      for (std::size_t j = 0; j < d; ++j) out[i][j] = tr[i * d + j] + bo[j];
+    if (save_intermediates) {
+      cache["Q"] = std::move(Q);
+      cache["K"] = std::move(K);
+      cache["V"] = std::move(V);
+      cache["ctx"] = std::move(ctx);
+    }
+  }
+
   // Same computation as forward(), but RETAINS the committed intermediates the
   // backward pass (AttentionBackward) needs: the Q/K/V projections, the per
   // (token,head) softmax probabilities, and ctx BEFORE the output projection
@@ -161,6 +277,7 @@ public:
                     const Mat &H, const Mat &Wq, const std::vector<IntFp> &bq, const Mat &Wk,
                     const std::vector<IntFp> &bk, const Mat &Wv, const std::vector<IntFp> &bv,
                     const Mat &Wo, const std::vector<IntFp> &bo) {
+    if (prob_extra()) throw std::runtime_error("FixedAttention::forward_save: LSE out_bits > P needs forward_seq");
     const std::size_t s = H.size();
     Q_saved.assign(s, {});
     K_saved.assign(s, {});
@@ -266,6 +383,46 @@ public:
       }
       qi->dense_layer(ff, W2, b2, geluout); // ffn -> d
       qi->add(out[i], a[i], ff);
+    }
+  }
+
+  // forward() with whole-sequence matmuls (FixedAttention::forward_seq, dense_seq) and one
+  // batched GELU lookup.  Same committed values and caches as forward().
+  void forward_seq(Mat &out, const Mat &x, const std::vector<IntFp> &g1,
+                   const std::vector<IntFp> &b1n, const std::vector<IntFp> &g2,
+                   const std::vector<IntFp> &b2n, const Mat &Wq, const std::vector<IntFp> &bq,
+                   const Mat &Wk, const std::vector<IntFp> &bk, const Mat &Wv,
+                   const std::vector<IntFp> &bv, const Mat &Wo, const std::vector<IntFp> &bo,
+                   const Mat &W1, const std::vector<IntFp> &b1, const Mat &W2,
+                   const std::vector<IntFp> &b2) {
+    const std::size_t s = x.size();
+
+    Mat normed(s), attn_out;
+    for (std::size_t i = 0; i < s; ++i) ln1->forward(normed[i], x[i], g1, b1n);
+    attn->forward_seq(attn_out, normed, Wq, bq, Wk, bk, Wv, bv, Wo, bo);
+    if (save_intermediates) cache["normed"] = std::move(normed);
+
+    Mat a(s), n2(s), hidden, ff;
+    for (std::size_t i = 0; i < s; ++i) {
+      qi->add(a[i], x[i], attn_out[i]);
+      ln2->forward(n2[i], a[i], g2, b2n);
+    }
+    dense_seq(qi, hidden, W1, b1, flat_of(n2), s); // d -> ffn
+    const std::vector<IntFp> hf = flat_of(hidden);
+    const IntFp off(static_cast<uint64_t>(gelu->offset), PUBLIC);
+    std::vector<IntFp> idx(hf.size()), gf;
+    for (std::size_t k = 0; k < hf.size(); ++k) idx[k] = hf[k] + off;
+    gelu->tbl->lookup(gf, idx); // GELU for the whole sequence in one batched feed
+    dense_seq(qi, ff, W2, b2, gf, s); // ffn -> d
+
+    out.assign(s, std::vector<IntFp>(d));
+    for (std::size_t i = 0; i < s; ++i) qi->add(out[i], a[i], ff[i]);
+    if (save_intermediates) {
+      Mat go(s);
+      for (std::size_t i = 0; i < s; ++i) go[i].assign(gf.begin() + i * ffn, gf.begin() + (i + 1) * ffn);
+      cache["normed2"] = std::move(n2);
+      cache["hidden"] = std::move(hidden);
+      cache["geluout"] = std::move(go);
     }
   }
 };

@@ -107,6 +107,12 @@ P=12 build/bin/test_ml-fixed_onnx_infer 2 24020 $M > b.log 2>&1
 
 - **`LSE=1`** — DeepProve LogSumExp softmax: drops the max-subtract (`select_max`) and the division, and
   batches the exp lookup. Recommended for GPT-2/BERT; the division softmax is the default without it.
+  The prover's per-row shift is bound only by checking that the row sums to 1 within a tolerance
+  `err = L/2 + 2^LSE_BITS + 4` output units (rounding of each of the L outputs, and of the shift), so a
+  prover may scale a row by up to `err / 2^(P+LSE_BITS)`. **`LSE_BITS`** (default 8) outputs the exps at
+  2^-(P+LSE_BITS), giving 0.05% at L=512 (with `LSE_BITS=0` it is 6.4%; DeepProve's 2^-16 output gives
+  ~1%); the extra bits are dropped by the attn@V MatMul's requant. **`LSE_MAX_SLACK`** (default 0.005)
+  refuses to prove a row whose tolerance exceeds it.
 
 ---
 
@@ -130,6 +136,8 @@ pass: ml-fixed proved ... (verifier accepted)          # <- success (BOB prints 
 |---|---|
 | `P` | fixed-point fractional bits (uniform 2⁻ᴾ). `12` ≈ fp32; low values are coarse. |
 | `LSE` | DeepProve LogSumExp softmax (no `max_value`, no division). Needs no extra setup. |
+| `LSE_BITS` | Extra output bits of the LSE exp table (default 8); sets the normalization slack. |
+| `LSE_MAX_SLACK` | Refuse LSE rows whose normalization slack exceeds this fraction (default 0.005). |
 | `MODEL` | path to the fp32 ONNX (GPT-2/BERT; CNN takes the model as the 4th CLI arg instead). |
 | `IDS` / `SEQ` | GPT-2/BERT public token ids / sequence length. |
 | `INPUT_F32` | (CNN) raw float32 CHW input file to prove on (else a default input). |

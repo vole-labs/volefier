@@ -49,9 +49,13 @@ int main(int argc, char **argv) {
     const std::size_t SB = getenv("SCORE_BITS") ? (std::size_t)atoi(getenv("SCORE_BITS")) : (std::size_t)(P + 9); const uint64_t ET = 1ull << SB;
     const uint64_t GT = 1u << (P + 7); const int64_t GOFF = 1LL << (P + 6);
     const bool lse = getenv("LSE") != nullptr;   // DeepProve LogSumExp softmax (no max_value/division)
-    FixedTable expt(ET, party, ios[0]->io); expt.Setup(build_exp_table(ET, P, !lse));  // LSE needs the non-clamped table
+    const int LX = lse ? (getenv("LSE_BITS") ? atoi(getenv("LSE_BITS")) : 8) : 0;   // extra LSE exp output bits
+    const double LSE_MAX_SLACK = getenv("LSE_MAX_SLACK") ? atof(getenv("LSE_MAX_SLACK")) : 0.005;
+    FixedTable expt(ET, party, ios[0]->io); expt.Setup(build_exp_table(ET, P, !lse, P + LX));  // LSE needs the non-clamped table
+    // LSE: exp outputs at 2^-(P+LSE_BITS) keep the row-sum check (the only thing binding the prover's
+    // shift) tight: slack ~ (L/2 + 2^LSE_BITS) / 2^(P+LSE_BITS).  LSE_MAX_SLACK refuses looser rows.
     FixedTable gtab(GT, party, ios[0]->io); gtab.Setup(build_gelu_table(GT, P, GOFF));
-    FixedGraphInfer gi(&qi, &cmp, party, P); gi.divr = &divr; gi.rcmp = &rclu; gi.exp_tab = &expt; gi.gelu_tab = &gtab; gi.gelu_off = GOFF; gi.score_bits = SB; gi.lse_softmax = lse;
+    FixedGraphInfer gi(&qi, &cmp, party, P); gi.divr = &divr; gi.rcmp = &rclu; gi.exp_tab = &expt; gi.gelu_tab = &gtab; gi.gelu_off = GOFF; gi.score_bits = SB; gi.lse_softmax = lse; gi.lse_extra_bits = LX; gi.lse_max_slack = LSE_MAX_SLACK;
     vector<int64_t> xr(seq, 0); vector<IntFp> cx; qi.commit_vec(cx, xr); vector<int64_t> oref;
     printf("[%d] running %zu ops...\n", party, g.nodes.size());
     vector<IntFp> out = gi.run(g, cx, xr, oref);

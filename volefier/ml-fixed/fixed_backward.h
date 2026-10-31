@@ -49,6 +49,26 @@ public:
       dLdscores[i] = (i == true_token) ? (p[i] + one.negate()) : p[i];
   }
 
+  // Cross-entropy with a PRIVATE label: onehot is a committed 0/1 vector (scale 1) instead of a
+  // public index, proven well formed here -- every entry a bit (g(g-1)=0, batched through the
+  // shared Hadamard2IP) and the entries summing to 1 -- so the verifier never learns the target.
+  //   dL/dscores[i] = p[i] - onehot[i] * 2^P.
+  void cross_entropy_private(std::vector<IntFp> &dLdscores, const std::vector<IntFp> &p,
+                             const std::vector<IntFp> &onehot) const {
+    const std::size_t L = p.size();
+    const uint64_t two_p = static_cast<uint64_t>(1) << qi->precision;
+    std::vector<IntFp> om1(L);
+    IntFp sum(static_cast<uint64_t>(0), PUBLIC);
+    dLdscores.resize(L);
+    for (std::size_t i = 0; i < L; ++i) {
+      om1[i] = onehot[i] - static_cast<uint64_t>(1);
+      sum = sum + onehot[i];
+      dLdscores[i] = p[i] + (onehot[i] * two_p).negate();
+    }
+    volefier::global_h2ip()->add_zero(onehot.data(), om1.data(), L); // onehot[i] in {0,1}
+    (sum - static_cast<uint64_t>(1)).reveal_zero();                   // exactly one 1
+  }
+
   // General case:  dL/dscores[i] = p[i] * (dL/dp[i] - dot),  dot = <p, dL/dp>.
   // Both p and dL/dp are at scale 2^-P.  The inner product lands at 2^-2P, so it
   // is requantized back to 2^-P before the subtraction; the per-element product
@@ -64,6 +84,18 @@ public:
     for (std::size_t i = 0; i < L; ++i)
       prod[i] = p[i] * (dLdp[i] + dot.negate());
     qi->requant_cm(dLdscores, prod, 1, qi->precision);
+  }
+
+  // general() at finer scales, for long rows: with L keys the probabilities are ~1/L, so at
+  // 2^-P most p[i]*(dL/dp[i]-dot) round to 0 or +-1 ulp.  Here p is at 2^-pbits, dL/dp comes in
+  // at 2^-2P, dot is kept at 2^-2P, and the 2^-(2P+pbits) product is NOT requantized -- the
+  // caller does that in one batched requant over all rows.
+  void general_fine(std::vector<IntFp> &prod, const std::vector<IntFp> &p,
+                    const std::vector<IntFp> &dLdp, std::size_t pbits) const {
+    const std::size_t L = p.size();
+    IntFp dot = qi->requant_cm_one(qi->dot(p, dLdp), 1, pbits); // -> 2^-2P
+    prod.resize(L);
+    for (std::size_t i = 0; i < L; ++i) prod[i] = p[i] * (dLdp[i] + dot.negate());
   }
 };
 
@@ -572,7 +604,6 @@ public:
   }
 };
 
-// ---------------------------------------------------------------------------
 // LM-head (unembedding) backward for a single position -- the output side of
 // proof-of-fine-tuning.  Forward:
 //   logits = requant(We @ H) + be        (We: vocab x d, H: d, logits: vocab)
@@ -602,6 +633,226 @@ public:
     qi->requant_cm(dLdWe_flat, dWe_i, 1, P); // 2^-2P -> 2^-P
     qi->requant_cm(dLdH, dH_i, 1, P);
     dLdbe = dLdlogits; // dL/dbe = dL/dlogits, free
+  }
+
+  // Frozen head, many positions (LoRA fine-tuning):  dL/dH = dL/dlogits @ We for every loss
+  // position at once with ONE whole-sequence matmul; no dL/dWe.  dLdlogits: T x vocab, 2^-P.
+  void input_grad(Mat &dLdH, const Mat &dLdlogits, const Mat &We) const {
+    const std::size_t T = dLdlogits.size(), vocab = We.size(), d = vocab ? We[0].size() : 0;
+    std::vector<IntFp> raw, out;
+    mm_seq(qi, raw, flat_of(dLdlogits), flat_of(We), T, d, vocab); // 2^-2P
+    qi->requant_cm(out, raw, 1, qi->precision);
+    dLdH.assign(T, std::vector<IntFp>(d));
+    for (std::size_t t = 0; t < T; ++t)
+      for (std::size_t k = 0; k < d; ++k) dLdH[t][k] = out[t * d + k];
+  }
+};
+
+// ---------------------------------------------------------------------------
+// LoRA adapter on one frozen projection W (dout x din):  W_eff = W + (alpha/r) * B @ A, with
+// B: dout x r and A: r x din, both flat row-major.  The adapters live at a FINER master scale
+// 2^-(P+E) (E extra fractional bits, like fp32 master weights in mixed precision) so a small SGD
+// step does not round to zero; W_eff is produced at the activation scale 2^-P.  Both directions
+// are proven from the COMMITTED adapters, so the forward pass is bound to them:
+//   effective():  W_eff = W + round(B@A * s_c / 2^s_M)              (B@A at 2^-2(P+E))
+//   sgd_step():   B' = B - round((dW_eff @ A^T) * g_c / 2^g_M)
+//                 A' = A - round((B^T @ dW_eff) * g_c / 2^g_M)      (both at 2^-(2P+E+G))
+// with s_c/2^s_M = (alpha/r) * 2^-(P+2E) and g_c/2^g_M = eta * (alpha/r) * 2^-(P+G), eta the
+// step's learning rate and dW_eff taken at the finer gradient scale 2^-(P+G) that
+// LoRABlockBackward produces.  (alpha/r) enters both directions exactly as in standard LoRA.
+class LoRAAdapter {
+public:
+  FixedInfer *qi;
+  std::size_t dout, din, r, E, G;
+  uint64_t s_c, g_c;
+  std::size_t s_M, g_M;
+
+  LoRAAdapter(FixedInfer *qi_, std::size_t dout_, std::size_t din_, std::size_t r_,
+              std::size_t E_, std::size_t G_, double scale, double eta)
+      : qi(qi_), dout(dout_), din(din_), r(r_), E(E_), G(G_) {
+    const std::size_t P = qi->precision;
+    to_fixed(scale, s_c, s_M);
+    s_M += P + 2 * E;
+    to_fixed(eta * scale, g_c, g_M);
+    g_M += P + G;
+  }
+
+  // x ~= c / 2^M with c in [2^9, 2^10): 10 significant bits keeps acc*c far below 2^60.
+  static void to_fixed(double x, uint64_t &c, std::size_t &M) {
+    int e;
+    std::frexp(x, &e); // x = m * 2^e, m in [0.5, 1)
+    M = static_cast<std::size_t>(10 - e);
+    c = static_cast<uint64_t>(llround(std::ldexp(x, static_cast<int>(M))));
+  }
+
+  void effective(Mat &W_eff, const Mat &W, const std::vector<IntFp> &B,
+                 const std::vector<IntFp> &A) const {
+    std::vector<IntFp> raw, delta;
+    mm_seq(qi, raw, B, A, dout, din, r);
+    qi->requant_cm(delta, raw, s_c, s_M);
+    W_eff.assign(dout, std::vector<IntFp>(din));
+    for (std::size_t i = 0; i < dout; ++i)
+      for (std::size_t j = 0; j < din; ++j) W_eff[i][j] = W[i][j] + delta[i * din + j];
+  }
+
+  // One SGD step on both adapters from dL/dW_eff (dout x din, 2^-(P+G)); both use the OLD B, A.
+  void sgd_step(std::vector<IntFp> &B_new, std::vector<IntFp> &A_new, const std::vector<IntFp> &B,
+                const std::vector<IntFp> &A, const std::vector<IntFp> &dWeff) const {
+    std::vector<IntFp> rawB, rawA, uB, uA;
+    mm_seq(qi, rawB, dWeff, transpose_of(A, r, din), dout, r, din); // dW_eff @ A^T
+    mm_seq(qi, rawA, transpose_of(B, dout, r), dWeff, r, din, dout); // B^T @ dW_eff
+    qi->requant_cm(uB, rawB, g_c, g_M);
+    qi->requant_cm(uA, rawA, g_c, g_M);
+    B_new.resize(B.size());
+    A_new.resize(A.size());
+    for (std::size_t t = 0; t < B.size(); ++t) B_new[t] = B[t] + uB[t].negate();
+    for (std::size_t t = 0; t < A.size(); ++t) A_new[t] = A[t] + uA[t].negate();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Transformer-block backward over a whole sequence for FROZEN base weights (LoRA fine-tuning).
+// Same math and scales as FFNBackward + AttentionBackward::forward_full + LayerNormBackward, but
+//   * every matmul is one whole-sequence mm_seq (per head for the attention core) instead of
+//     per-token matmul_backward calls, and
+//   * frozen weights get no gradient: the only weight gradients produced are dL/dW_q and dL/dW_v
+//     (the adapted projections, taken w.r.t. W_eff), each one d x d matmul over the sequence,
+//     kept at the finer scale 2^-(P+G) -- they only feed LoRAAdapter::sgd_step, and at 2^-P a
+//     small gradient (e.g. W_q's under near-uniform attention) would round to zero.
+// The per-token gadgets commit an s x dout x din outer-product tensor for EVERY weight, which at
+// GPT-2 size (s=512) is ~3.6e9 committed values per block.  Consumes the forward caches of the
+// block's FixedLayerNorm / FixedAttention / FixedTransformerBlock (save_intermediates = true).
+class LoRABlockBackward {
+public:
+  FixedInfer *qi;
+  LayerNormBackward *lnb;
+  GELUBackward *gb; // GELU' lookup (caller owns + Teardown()s it)
+  std::size_t d, h, dh, ffn, G;
+  uint64_t qinv;
+
+  LoRABlockBackward(FixedInfer *qi_, LayerNormBackward *lnb_, GELUBackward *gb_, std::size_t d_,
+                    std::size_t h_, std::size_t ffn_, uint64_t qinv_, std::size_t G_)
+      : qi(qi_), lnb(lnb_), gb(gb_), d(d_), h(h_), dh(d_ / h_), ffn(ffn_), G(G_), qinv(qinv_) {}
+
+  // dLdout: s x d (2^-P).  Wq / Wv are the EFFECTIVE weights used in the forward pass.
+  // dWq / dWv come out at 2^-(P+G).
+  void forward(Mat &dLdx, std::vector<IntFp> &dWq, std::vector<IntFp> &dWv, const Mat &dLdout,
+               FixedLayerNorm &ln1, FixedLayerNorm &ln2, FixedAttention &attn,
+               FixedTransformerBlock &blk, const Mat &Wq, const Mat &Wk, const Mat &Wv,
+               const Mat &Wo, const Mat &W1, const Mat &W2, const std::vector<IntFp> &g1,
+               const std::vector<IntFp> &g2) const {
+    const std::size_t s = dLdout.size(), P = qi->precision;
+    const IntFp zero(static_cast<uint64_t>(0), PUBLIC);
+    std::vector<IntFp> raw;
+
+    // ---- FFN:  dGelu = dOut @ W2,  dHidden = dGelu (.) GELU'(hidden),  dN2 = dHidden @ W1 ----
+    std::vector<IntFp> dGelu, dHid, dN2;
+    mm_seq(qi, raw, flat_of(dLdout), flat_of(W2), s, ffn, d);
+    qi->requant_cm(dGelu, raw, 1, P);
+    gb->forward(dHid, dGelu, flat_of(blk.cache["hidden"]));
+    mm_seq(qi, raw, dHid, flat_of(W1), s, d, ffn);
+    qi->requant_cm(dN2, raw, 1, P);
+
+    // ---- LN2 backward + residual:  dL/da = dL/dout + LN2'(dN2) ----
+    Mat dLda;
+    ln_backward(dLda, dLdout, dN2, ln2, g2);
+
+    // ---- attention.  dCtx = dL/da @ Wo stays at the 2^-2P ctx scale (as in AttentionBackward) ----
+    std::vector<IntFp> dCtx;
+    mm_seq(qi, dCtx, flat_of(dLda), flat_of(Wo), s, d, d);
+    Mat &Q = attn.cache["Q"], &K = attn.cache["K"], &V = attn.cache["V"];
+    Mat &probs = attn.cache["probs"]; // row i*h+hh: length i+1, 2^-(P+X)
+    const std::size_t X = static_cast<std::size_t>(attn.prob_extra());
+    std::vector<IntFp> dQ(s * d), dK(s * d), dV(s * d);
+    SoftmaxBackward sb(qi);
+    for (std::size_t hh = 0; hh < h; ++hh) {
+      const std::size_t off = hh * dh;
+      std::vector<IntFp> Qh(s * dh), Kh(s * dh), VhT(dh * s), dCh(s * dh), Pr(s * s, zero);
+      for (std::size_t i = 0; i < s; ++i) {
+        for (std::size_t k = 0; k < dh; ++k) {
+          Qh[i * dh + k] = Q[i][off + k];
+          Kh[i * dh + k] = K[i][off + k];
+          VhT[k * s + i] = V[i][off + k];
+          dCh[i * dh + k] = dCtx[i * d + off + k];
+        }
+        for (std::size_t j = 0; j <= i; ++j) Pr[i * s + j] = probs[i * h + hh][j];
+      }
+      // dprobs = dCtx_h @ V_h^T (2^-3P -> 2^-2P); only the causal j <= i entries are kept.
+      // The softmax Jacobian and dS stay at 2^-2P: at 2^-P the ~1/L-sized entries of dS
+      // round away and dQ (a sum over L keys) loses accuracy as the sequence grows.
+      mm_seq(qi, raw, dCh, VhT, s, s, dh);
+      std::vector<IntFp> causal, dpr;
+      causal.reserve(s * (s + 1) / 2);
+      for (std::size_t i = 0; i < s; ++i)
+        for (std::size_t j = 0; j <= i; ++j) causal.push_back(raw[i * s + j]);
+      qi->requant_cm(dpr, causal, 1, P);
+      // dV_h = probs_h^T @ dCtx_h (2^-(3P+X) -> 2^-2P, kept fine for dW_v like dQ)
+      std::vector<IntFp> dVh;
+      mm_seq(qi, raw, transpose_of(Pr, s, s), dCh, s, dh, s);
+      qi->requant_cm(dVh, raw, 1, P + X);
+      // softmax Jacobian per query row (2^-(3P+X)) -> dS at 2^-2P
+      std::vector<IntFp> dsc, dsq;
+      dsc.reserve(causal.size());
+      for (std::size_t i = 0, base = 0; i < s; base += i + 1, ++i) {
+        std::vector<IntFp> dp(dpr.begin() + base, dpr.begin() + base + i + 1), ds;
+        sb.general_fine(ds, probs[i * h + hh], dp, P + X);
+        dsc.insert(dsc.end(), ds.begin(), ds.end());
+      }
+      qi->requant_cm(dsq, dsc, 1, P + X);
+      std::vector<IntFp> dS(s * s, zero);
+      for (std::size_t i = 0, t = 0; i < s; ++i)
+        for (std::size_t j = 0; j <= i; ++j) dS[i * s + j] = dsq[t++];
+      // dQ_h = dS @ K_h,  dK_h = dS^T @ Q_h  (2^-3P), each times the fused forward 1/sqrt(dh)
+      // (qinv, 2^-P) in its requant: dQ to 2^-2P (kept fine for dW_q), dK to 2^-P.  Applying
+      // qinv here rather than on dS keeps every intermediate ~ (true value) * 2^48.
+      std::vector<IntFp> dQh, dKh;
+      mm_seq(qi, raw, dS, Kh, s, dh, s);
+      qi->requant_cm(dQh, raw, qinv, 2 * P);
+      mm_seq(qi, raw, transpose_of(dS, s, s), Qh, s, dh, s);
+      qi->requant_cm(dKh, raw, qinv, 3 * P);
+      for (std::size_t i = 0; i < s; ++i)
+        for (std::size_t k = 0; k < dh; ++k) {
+          dQ[i * d + off + k] = dQh[i * dh + k];
+          dK[i * d + off + k] = dKh[i * dh + k];
+          dV[i * d + off + k] = dVh[i * dh + k];
+        }
+    }
+
+    // ---- projections:  dL/dnormed = dQ@Wq + dK@Wk + dV@Wv,  dW{q,v} = dX^T @ normed ----
+    // dQ and dV are at 2^-2P (dK at 2^-P): their products land at 2^-3P and are brought to
+    // 2^-2P first, in one requant.
+    std::vector<IntFp> rq, rk, rv, rqv, dNrm;
+    mm_seq(qi, rq, dQ, flat_of(Wq), s, d, d);
+    mm_seq(qi, rv, dV, flat_of(Wv), s, d, d);
+    for (std::size_t t = 0; t < s * d; ++t) rq[t] = rq[t] + rv[t];
+    qi->requant_cm(rqv, rq, 1, P);
+    mm_seq(qi, rk, dK, flat_of(Wk), s, d, d);
+    for (std::size_t t = 0; t < s * d; ++t) rk[t] = rqv[t] + rk[t];
+    qi->requant_cm(dNrm, rk, 1, P);
+    const std::vector<IntFp> nrm = flat_of(blk.cache["normed"]);
+    mm_seq(qi, raw, transpose_of(dQ, s, d), nrm, d, d, s);
+    qi->requant_cm(dWq, raw, 1, 2 * P - G); // 2^-3P -> 2^-(P+G)
+    mm_seq(qi, raw, transpose_of(dV, s, d), nrm, d, d, s);
+    qi->requant_cm(dWv, raw, 1, 2 * P - G);
+
+    // ---- LN1 backward + residual:  dL/dx = dL/da + LN1'(dNrm) ----
+    ln_backward(dLdx, dLda, dNrm, ln1, g1);
+  }
+
+private:
+  // out[i] = resid[i] + LayerNorm'(dy[i]) per token, from the LN's cached c / dinv.  gamma is
+  // frozen, so its gradient (computed by LayerNormBackward anyway) is dropped.
+  void ln_backward(Mat &out, const Mat &resid, const std::vector<IntFp> &dy, FixedLayerNorm &ln,
+                   const std::vector<IntFp> &g) const {
+    Mat &c = ln.cache_mat["c"];
+    std::vector<IntFp> &dinv = ln.cache_scalar_vec["dinv"];
+    const std::size_t s = resid.size();
+    out.assign(s, std::vector<IntFp>(d));
+    for (std::size_t i = 0; i < s; ++i) {
+      std::vector<IntFp> dyi(dy.begin() + i * d, dy.begin() + (i + 1) * d), dxi, dgi, dbi;
+      lnb->forward(dxi, dgi, dbi, dyi, c[i], g, dinv[i], d);
+      for (std::size_t k = 0; k < d; ++k) out[i][k] = resid[i][k] + dxi[k];
+    }
   }
 };
 

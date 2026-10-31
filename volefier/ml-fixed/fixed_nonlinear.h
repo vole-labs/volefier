@@ -8,7 +8,9 @@
 #include "volefier/zk-ram/logup_keyvalue.h"
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 using namespace emp;
@@ -56,12 +58,16 @@ public:
 // ---- host-side table builders (scale 2^-P) --------------------------------
 
 // exp table for softmax:  expT[t] = round( exp(-t * 2^-P) * 2^P ), clamped >= 1
-// so a softmax denominator is never zero (matches zkGPT's max(.,1)).
-static inline std::vector<uint64_t> build_exp_table(uint64_t T, int P, bool clamp_pos = true) {
+// so a softmax denominator is never zero (matches zkGPT's max(.,1)).  out_bits > P stores the
+// output at the finer scale 2^-out_bits (the division softmax is scale-free in the table output),
+// which keeps a long tail of tiny terms -- e.g. a 50k-token vocabulary -- from rounding away.
+static inline std::vector<uint64_t> build_exp_table(uint64_t T, int P, bool clamp_pos = true,
+                                                    int out_bits = -1) {
   std::vector<uint64_t> e(T);
   const double scale = static_cast<double>(1ULL << P);
+  const double oscale = static_cast<double>(1ULL << (out_bits < 0 ? P : out_bits));
   for (uint64_t t = 0; t < T; ++t) {
-    long long v = llround(std::exp(-static_cast<double>(t) / scale) * scale);
+    long long v = llround(std::exp(-static_cast<double>(t) / scale) * oscale);
     // clamp_pos=true (division path): >= 1 so the softmax denominator is never zero.
     // clamp_pos=false (LSE path): exact exp -> 0 for large t, so the row sums to exactly 2^P.
     e[t] = static_cast<uint64_t>(clamp_pos ? (v < 1 ? 1 : v) : (v < 0 ? 0 : v));
@@ -122,6 +128,25 @@ public:
   int P;
   std::size_t score_bits; // bit width of (max - logit); = log2(exp table size)
   bool lse = false;       // DeepProve LogSumExp path: no max_value, no division
+  int out_bits = -1;      // LSE only: probabilities come out at 2^-out_bits (< 0 -> P); the exp
+                          // table must be built with the same out_bits.  Each output's rounding
+                          // adds 1/2 ulp to the normalization slack, so at long rows a finer
+                          // output scale is what keeps the proven sum close to 1.
+  double max_slack = 0;   // LSE only: if > 0, refuse a row whose normalization tolerance err/2^ob
+                          // (the factor a prover may scale the row by) exceeds this
+
+  // LSE normalization tolerance for a row of L, in output ulps: per-element rounding (<= L/2) +
+  // shift quantization (~2^ob * in_scale) + slack.  Relative to the row sum it is err / 2^ob.
+  uint64_t lse_err(std::size_t L) const {
+    const double isc =
+        (in_scale > 0) ? in_scale : 1.0 / static_cast<double>(static_cast<uint64_t>(1) << P);
+    const int ob = (out_bits < 0) ? P : out_bits;
+    return static_cast<uint64_t>(L) / 2 +
+           static_cast<uint64_t>(std::ceil(std::pow(2.0, ob) * isc)) + 4;
+  }
+  double lse_slack(std::size_t L) const {
+    return static_cast<double>(lse_err(L)) / std::pow(2.0, (out_bits < 0) ? P : out_bits);
+  }
   double in_scale = -1.0; // exp-table input scale (default < 0 -> 2^-P)
 
   FixedSoftmax(FixedInfer *qi_, CompareLU *cmp_, FixedTable *expt_, Div *divr_, int P_,
@@ -158,9 +183,11 @@ public:
     const std::size_t L = logits.size();
     const double isc =
         (in_scale > 0) ? in_scale : 1.0 / static_cast<double>(static_cast<uint64_t>(1) << P);
-    // err = per-elt rounding (<= L/2) + shift quantization (~2^P*in_scale) + slack.
-    const uint64_t err = static_cast<uint64_t>(L) / 2 +
-                         static_cast<uint64_t>(std::ceil(std::pow(2.0, P) * isc)) + 4;
+    const uint64_t err = lse_err(L);
+    if (max_slack > 0 && lse_slack(L) > max_slack)
+      throw std::runtime_error("LSE softmax: normalization slack " + std::to_string(lse_slack(L)) +
+                               " for a row of " + std::to_string(L) + " exceeds max_slack " +
+                               std::to_string(max_slack) + " (raise the exp table's out_bits)");
     std::size_t wfb = 0;
     for (uint64_t v = 2 * err; v; v >>= 1) ++wfb;
     std::vector<int64_t> rl;
@@ -191,6 +218,10 @@ public:
         sum += std::exp(-static_cast<double>(mref - rlog[i]) * isc);
       shift_v = static_cast<int64_t>(llround(std::log(sum) / isc));
       if (shift_v < 0) shift_v = 0;
+      // negative test only: a cheating prover offsets the shift, scaling the whole row by
+      // exp(-k * isc); the normalization check must reject it once that exceeds the slack
+      static const int64_t cheat = getenv("LSE_CHEAT_SHIFT") ? atoll(getenv("LSE_CHEAT_SHIFT")) : 0;
+      shift_v += cheat;
     }
     IntFp shift(static_cast<uint64_t>(shift_v), ALICE); // committed LSE shift witness (>= 0)
     std::vector<IntFp> keys(L);
@@ -199,9 +230,10 @@ public:
     expt->lookup(out, keys); // batched Access: ONE feed for all L returned values
     IntFp sumout(static_cast<uint64_t>(0), PUBLIC);
     for (std::size_t i = 0; i < L; ++i) sumout = sumout + out[i];
-    // normalization check (replaces the division): | sum_i out_i - 2^P | <= err -> forces
+    // normalization check (replaces the division): | sum_i out_i - 2^ob | <= err -> forces
     // shift = logsumexp.
-    IntFp delta = sumout + IntFp(static_cast<uint64_t>(1) << P, PUBLIC).negate();
+    const int ob = (out_bits < 0) ? P : out_bits;
+    IntFp delta = sumout + IntFp(static_cast<uint64_t>(1) << ob, PUBLIC).negate();
     rc->check(delta + IntFp(err, PUBLIC), wf_bits);          // delta + err >= 0
     rc->check(IntFp(err, PUBLIC) + delta.negate(), wf_bits); // err - delta >= 0
     return out;

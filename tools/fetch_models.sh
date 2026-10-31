@@ -43,35 +43,35 @@ llm_build() {
   local out="$1" hf="${3:-$2}"
   [ -f model/eval/gpt2_eval/wikitext2_test.txt ] || \
     echo ">> note: run 'tools/fetch_models.sh wikitext' for real QDQ calibration (else random fallback)"
-  $PY tools/export_llm_onnx.py "$hf" "model/$out"
-  $PY tools/quantize_llm_qdq.py "model/$out/model.onnx" "model/$out-qdq.onnx" "$hf"
+  $PY tools/quantize_export/export_llm_onnx.py "$hf" "model/$out"
+  $PY tools/quantize_export/quantize_llm_qdq.py "model/$out/model.onnx" "model/$out-qdq.onnx" "$hf"
 }
 
 case "${1:-list}" in
   list|-h|--help|help) usage ;;
 
-  gpt2)         $PY tools/export_gpt2_nocache.py gpt2 model/gpt2-12_nocache ;;
+  gpt2)         $PY tools/quantize_export/export_gpt2_nocache.py gpt2 model/gpt2-12_nocache ;;
   gpt2-quarot)
     [ -f model/gpt2-12_nocache/model.onnx ] || { echo "need gpt2 first:  tools/fetch_models.sh gpt2"; exit 1; }
-    PYTHONPATH=. $PY tools/export_quarot_onnx.py model/gpt2-12_nocache/model.onnx model/gpt2-12-quarot.onnx ;;
+    PYTHONPATH=. $PY tools/quantize_export/export_quarot_onnx.py model/gpt2-12_nocache/model.onnx model/gpt2-12-quarot.onnx ;;
 
-  bert)         $PY tools/export_bert.py ;;
+  bert)         $PY tools/quantize_export/export_bert.py ;;
 
-  resnet18)     $PY tools/quantize_cnn.py "$ZOO/resnet/model/resnet18-v1-7.onnx"  model/resnet18-v1-7-qdq.onnx  model/eval/resnet18-v1-7/resnet18-v1-7.onnx ;;
-  resnet50)     $PY tools/quantize_cnn.py "$ZOO/resnet/model/resnet50-v1-7.onnx"  model/resnet50-v1-7-qdq.onnx  model/eval/resnet50-v1-7/resnet50-v1-7.onnx ;;
-  vgg16)        $PY tools/quantize_cnn.py "$ZOO/vgg/model/vgg16-7.onnx"           model/vgg16-12-qdq.onnx       model/eval/vgg16/vgg16.onnx ;;
+  resnet18)     $PY tools/quantize_export/quantize_cnn.py "$ZOO/resnet/model/resnet18-v1-7.onnx"  model/resnet18-v1-7-qdq.onnx  model/eval/resnet18-v1-7/resnet18-v1-7.onnx ;;
+  resnet50)     $PY tools/quantize_export/quantize_cnn.py "$ZOO/resnet/model/resnet50-v1-7.onnx"  model/resnet50-v1-7-qdq.onnx  model/eval/resnet50-v1-7/resnet50-v1-7.onnx ;;
+  vgg16)        $PY tools/quantize_export/quantize_cnn.py "$ZOO/vgg/model/vgg16-7.onnx"           model/vgg16-12-qdq.onnx       model/eval/vgg16/vgg16.onnx ;;
 
   qwen)         llm_build qwen2.5-0.5b  Qwen/Qwen2.5-0.5B-Instruct "${2:-}" ;;
   gemma)        llm_build gemma-3-270m  google/gemma-3-270m-it     "${2:-}" ;;
   llama)        llm_build llama-3.2-1b  meta-llama/Llama-3.2-1B    "${2:-}" ;;
 
-  wikitext)     $PY tools/fetch_eval_data.py wikitext ;;
-  lambada)      $PY tools/fetch_eval_data.py lambada ;;
-  gpt2-eval)    $PY tools/fetch_eval_data.py all ;;
+  wikitext)     $PY tools/quantize_export/fetch_eval_data.py wikitext ;;
+  lambada)      $PY tools/quantize_export/fetch_eval_data.py lambada ;;
+  gpt2-eval)    $PY tools/quantize_export/fetch_eval_data.py all ;;
 
   imagenet)
     cat <<'EOF'
-ImageNet val (6.3 GB, needed ONLY by tools/accuracy_baselines.py -- not by any ZK proof):
+ImageNet val (6.3 GB, needed ONLY by tools/accuracy/accuracy_baselines.py -- not by any ZK proof):
   1. Download the ILSVRC2012 validation set from https://image-net.org (registration required).
   2. Arrange as:  model/eval/imagenet/val/<wnid>/*.JPEG   and   model/eval/imagenet/class_map.csv
 EOF

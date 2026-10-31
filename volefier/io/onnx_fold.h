@@ -285,15 +285,19 @@ inline bool fold_eval(const OnnxNode &n, const std::map<std::string, HT> &V, HT 
     return true;
   }
   if (op == "Where") {
+    // numpy broadcast over all THREE operands: the output shape includes the condition's (a
+    // causal mask is Where(cond[1,1,S,S], 0, -inf) with scalar branches).
     const HT &c = in(0), &x = in(1), &y = in(2);
-    res = bcast(x, y, '+');
-    if (res.v.empty() || c.v.empty() || x.v.empty() || y.v.empty()) {
-      res.v.clear();
-      return false;
-    }
-    for (int64_t k = 0; k < res.numel(); ++k)
-      res.v[k] = c.v[c.numel() == 1 ? 0 : k] != 0 ? x.v[x.numel() == 1 ? 0 : k]
-                                                  : y.v[y.numel() == 1 ? 0 : k];
+    if (c.v.empty() || x.v.empty() || y.v.empty()) return false;
+    HT shp = bcast(bcast(c, x, '+'), y, '+'); // only its shape is used
+    if (shp.v.empty()) return false;
+    HT zero;
+    zero.dt = 7;
+    zero.shape = shp.shape;
+    zero.v.assign(shp.numel(), 0);
+    const HT cb = bcast(c, zero, '+'), xb = bcast(x, zero, '+'), yb = bcast(y, zero, '+');
+    res = shp;
+    for (int64_t k = 0; k < res.numel(); ++k) res.v[k] = cb.v[k] != 0 ? xb.v[k] : yb.v[k];
     res.dt = x.dt;
     return true;
   }

@@ -31,6 +31,7 @@ add_test_case_with_run(nonlinear bench_msb)
 # zkGPT-style rounded division (two-sided range relation, no MSB).
 add_test_case_with_run(nonlinear div)
 add_test_case_with_run(nonlinear range_compare)
+add_test_case_with_run(nonlinear rsqrt)
 
 # Standalone inner-product matmul (reimplements emp-zk's QuickSilver IP proof,
 # no singleton -> thread-able).

@@ -2093,8 +2093,8 @@ private:
     shp_[n.output[0]] = xs;
     scale_[n.output[0]] = 1.0 / sc;
     zp_[n.output[0]] = 0;
-    // exact-integer plaintext ref (matches QuantRMSNorm step-by-step): ms=mean(x^2), dinv=round(
-    // 2^2P/sqrt(ms)), y=rq(x*dinv), out=rq(y*gamma) -- no eps, no mean, no beta.
+    // exact-integer plaintext ref (matches QuantRMSNorm step-by-step): ms=mean(x^2)+1, dinv=round(
+    // 2^2P/sqrt(ms)), y=rq(x*dinv), out=rq(y*gamma) -- no mean, no beta.
     if (party == ALICE && (int)xr.size() == rows * d) {
       std::vector<int64_t> r((size_t)rows * d);
       const int64_t HP = (int64_t)1 << (P - 1);
@@ -2103,8 +2103,8 @@ private:
       for (int rr = 0; rr < rows; ++rr) {
         int64_t ssq = 0;
         for (int i = 0; i < d; ++i) { int64_t v = xr[(int64_t)rr * d + i]; ssq += v * v; }
-        int64_t ms = rdiv(ssq, d);
-        int64_t dinv = llround((double)((uint64_t)1 << (2 * P)) / std::sqrt((double)(ms > 0 ? ms : 1)));
+        int64_t ms = rdiv(ssq, d) + 1; // +1 eps matches QuantRMSNorm
+        int64_t dinv = llround((double)((uint64_t)1 << (2 * P)) / std::sqrt((double)ms));
         for (int i = 0; i < d; ++i)
           r[(int64_t)rr * d + i] = rq(rq(xr[(int64_t)rr * d + i] * dinv) * qg[i]);
       }

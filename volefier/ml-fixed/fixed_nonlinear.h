@@ -5,6 +5,7 @@
 #include "volefier/ml-fixed/fixed_infer.h"
 #include "volefier/nonlinear/comparison.h" // CompareLU (max_value, replaces find_max)
 #include "volefier/nonlinear/div.h"
+#include "volefier/nonlinear/rsqrt.h"     // prove_rsqrt (LayerNorm 1/sigma)
 #include "volefier/zk-ram/logup_keyvalue.h"
 #include <cmath>
 #include <cstdint>
@@ -19,8 +20,8 @@ using namespace emp;
 //   - activations (exp, GeLU) are PUBLIC function tables looked up with LogUp;
 //     the key-value binding simultaneously range-checks the index into [0, T).
 //   - softmax = max-subtract (Comp) -> exp lookup -> sum -> committed divide.
-//   - LayerNorm avoids a sqrt circuit: the prover commits d ~ 1/sigma and proves
-//     the well-formedness  | d^2 * var - 2^4p | <= TOL  with two sign checks.
+//   - LayerNorm avoids a sqrt circuit: the prover commits d ~ 1/sigma and proves it
+//     with bounded, wrap-free inequalities (prove_rsqrt).
 
 // ---------------------------------------------------------------------------
 // FixedTable: a read-only public-function lookup.  Setup() loads T raw field
@@ -259,8 +260,8 @@ public:
 // ---------------------------------------------------------------------------
 // LayerNorm (DeepProve sqrt-free):
 //   mu  = mean(x); c = x - mu; var = mean(c^2);
-//   commit d ~ round(2^2P / sqrt(var_q)) (the 2^-P encoding of 1/sigma);
-//   prove |d^2 * var_q - 2^4P| <= TOL;  y = trunc(c * d);  out = y*gamma + beta.
+//   commit d ~ round(2^2P / sqrt(var_q)) (the 2^-P encoding of 1/sigma), proven by
+//   prove_rsqrt;  y = trunc(c * d);  out = y*gamma + beta.
 class FixedLayerNorm {
 public:
   FixedInfer *qi;
@@ -268,8 +269,7 @@ public:
   Div *divr;        // zkGPT-style division (no MSB) for mean / variance
   int P;
   uint64_t d; // feature dimension
-  uint64_t TOL;
-  std::size_t wf_bits; // bit width of delta+TOL for the range check
+  int var_bits; // var_q (scale 2^-2P) must lie in [1, 2^var_bits): real variance < 2^20 by default
 
   // Backward-pass intermediate cache (opt-in): retain the COMMITTED c, dinv, y that
   // LayerNormBackward consumes.  Same save_intermediates flag + map pattern used by the
@@ -287,12 +287,7 @@ public:
   }
 
   FixedLayerNorm(FixedInfer *qi_, RangeCheckLU *rc_, Div *divr_, int P_, uint64_t d_)
-      : qi(qi_), rc(rc_), divr(divr_), P(P_), d(d_) {
-    TOL = static_cast<uint64_t>(1)
-          << (3 * P + 8); // bounds the 1/sqrt rounding error (widened: GPT-2 residual stream has
-                          // large, un-normalized variance)
-    wf_bits = 3 * P + 10; // delta+TOL in [0, 2*TOL = 2^(3P+9)] -> needs 3P+10 bits
-  }
+      : qi(qi_), rc(rc_), divr(divr_), P(P_), d(d_), var_bits(2 * P_ + 20) {}
 
   void forward(std::vector<IntFp> &out, const std::vector<IntFp> &x,
                const std::vector<IntFp> &gamma, const std::vector<IntFp> &beta) {
@@ -328,28 +323,11 @@ public:
     }
     IntFp var_q = divr->round_div(ssq, (uint64_t)(d));
     var_q = var_q + IntFp(static_cast<uint64_t>(1), PUBLIC);
-    // +1 epsilon (LayerNorm eps), matching QuantLayerNorm: a CONSTANT input gives var=0 -> without
-    // eps dinv is 1/0 (garbage) and |dinv^2*var - 2^4P| = 2^4P > TOL is unsatisfiable. With +1,
-    // var=0 -> dinv=2^2P and dinv^2*var=2^4P exactly (delta 0); negligible (2^-2P real) otherwise.
+    // +1 epsilon (LayerNorm eps), matching QuantLayerNorm: a CONSTANT input gives var=0, whose
+    // 1/sigma is undefined.  With +1, var=0 -> dinv=2^2P; negligible (2^-2P real) otherwise.
 
     // prover commits d ~ 1/sigma encoded at scale 2^-P
-    IntFp dinv;
-    if (qi->party == ALICE) {
-      uint64_t vq = static_cast<uint64_t>(VAL(var_q.value));
-      double sq = std::sqrt(static_cast<double>(vq));
-      long long di = llround(static_cast<double>(1ULL << (2 * P)) / sq);
-      dinv = IntFp(static_cast<uint64_t>(di), ALICE);
-    } else {
-      dinv = IntFp(static_cast<uint64_t>(0), ALICE);
-    }
-
-    // well-formedness: | dinv^2 * var_q - 2^4P | <= TOL
-    IntFp lhs = (dinv * dinv) * var_q;
-    IntFp target(static_cast<uint64_t>(1) << (4 * P), PUBLIC);
-    IntFp delta = lhs + target.negate();
-    // |delta| <= TOL via two non-negativity range checks (no MSB):
-    rc->check(delta + IntFp(TOL, PUBLIC), wf_bits);          // delta + TOL >= 0
-    rc->check(IntFp(TOL, PUBLIC) + delta.negate(), wf_bits); // TOL - delta >= 0
+    IntFp dinv = prove_rsqrt(rc, qi->party, var_q, P, var_bits);
 
     // y = trunc(c * dinv)   (scale 2^-P normalized) ; out = y*gamma + beta
     std::vector<IntFp> prod(n);

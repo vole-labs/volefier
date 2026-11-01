@@ -176,13 +176,18 @@ private:
   // 62-bit range comparisons of the legacy Mystique check (bd>=POS, bd>=NEGB)
   // with one high-bit OR-reduction -- ~7.5% fewer AND gates end-to-end on ResNet.
   // LEGACY_TRUNC=1 restores the old two-comparison range check.
+  // The remainder check alone pins t only modulo p (each in-range remainder admits its own
+  // huge field t), so t + 2^(TB-1) is decomposed in the same arith2bool batch and its bits
+  // >= TB must be zero.  TB = 59 - S keeps r' + t*2^S below p, so (t, r') is unique.
   void truncate(std::vector<IntFp> &v) {
     const int n = (int)v.size();
+    const int TB = 59 - S;
     std::vector<uint64_t> tval(n, 0);
     if (party == ALICE)
       for (int i = 0; i < n; ++i) {
         int64_t acc = dec((uint64_t)VAL(v[i].value));   // low 64 = value (new emp IntFp layout)
         int64_t tq = (int64_t)llround((double)acc / (double)(1LL << S));
+        if (std::llabs(tq) >= (1LL << (TB - 1))) error("ml-float truncation: output exceeds its bound\n");
         tval[i] = tq >= 0 ? (uint64_t)tq : PR - (uint64_t)(-tq);
       }
     std::vector<IntFp> t(n);
@@ -190,38 +195,41 @@ private:
     const uint64_t neg2S = PR - (1ULL << S);
 
     static const bool legacy_trunc = getenv("LEGACY_TRUNC") != nullptr;
+    std::vector<IntFp> cv(2 * n);   // [remainder term | t + 2^(TB-1)]
+    const IntFp shift((uint64_t)(legacy_trunc ? 0 : 1ULL << S), PUBLIC); // + 2^S (length check)
+    const IntFp toff((uint64_t)1 << (TB - 1), PUBLIC);
+    for (int i = 0; i < n; ++i) {
+      cv[i] = v[i] + t[i] * neg2S + shift;
+      cv[n + i] = t[i] + toff;
+    }
+    std::vector<ZKInt> bd(2 * n);
+    arith2bool(bd.data(), cv.data(), 2 * n);
+    n_eda += 2 * n;
+    Bit allbad = Bit::constant(ctx(), false);
+    for (int i = 0; i < n; ++i) {
+      Bit hi = bd[n + i][TB];                // t + 2^(TB-1): bits [TB .. 61] must be zero
+      for (int b = TB + 1; b < 62; ++b) hi = hi | bd[n + i][b];
+      allbad = allbad | hi;
+    }
     if (!legacy_trunc) {
-      std::vector<IntFp> rp(n);
-      const IntFp shift((uint64_t)(1ULL << S), PUBLIC); // + 2^S
-      for (int i = 0; i < n; ++i) rp[i] = v[i] + t[i] * neg2S + shift;
-      std::vector<ZKInt> bd(n);
-      arith2bool(bd.data(), rp.data(), n);
-      n_eda += n;
-      Bit allbad = Bit::constant(ctx(), false);
       for (int i = 0; i < n; ++i) {
         Bit hi = bd[i][S + 1];               // high bits [S+1 .. 61] must be zero
         for (int b = S + 2; b < 62; ++b) hi = hi | bd[i][b];
         allbad = allbad | hi;
       }
-      if (bsess->reveal(allbad, PUBLIC).value_or(false) && party == ALICE)
-        error("ml-float truncation length-check failed\n");
+      if (bsess->reveal(allbad, PUBLIC).value_or(true))   // BOTH parties abort: the verifier
+        error("ml-float truncation length-check failed\n"); // must not accept a failed check
       v = t;
       return;
     }
 
-    std::vector<IntFp> diff(n);
-    for (int i = 0; i < n; ++i) diff[i] = v[i] + t[i] * neg2S;
-    std::vector<ZKInt> bd(n);
-    arith2bool(bd.data(), diff.data(), n);
-    n_eda += n;
     ZKInt POS = kint((uint64_t)(1ULL << S)), NEGB = kint(PR - (uint64_t)(1ULL << S));
-    Bit allbad = Bit::constant(ctx(), false);
     for (int i = 0; i < n; ++i) {
       Bit p = bd[i] >= POS;
       Bit ng = bd[i] >= NEGB;
       allbad = allbad | (p & (!ng));
     }
-    if (bsess->reveal(allbad, PUBLIC).value_or(false) && party == ALICE)
+    if (bsess->reveal(allbad, PUBLIC).value_or(true))   // BOTH parties abort
       error("ml-float truncation range-check failed\n");
     v = t;
   }

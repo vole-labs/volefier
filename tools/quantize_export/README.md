@@ -10,6 +10,7 @@ per-tensor int8 (QDQ) versions, plus a few (de)quantization utilities. Outputs l
 | `export_gpt2_nocache.py` | Export GPT-2 small (12L, `use_cache=False`) to a no-cache fp32 ONNX. |
 | `export_llm_onnx.py` | Export an HF causal-LM (Qwen / Llama / Gemma / GPT-2) to a no-cache fp32 ONNX. |
 | `export_bert.py` | Export BERT-base (input-ids-only, fixed seq) to fp32 ONNX + static-QDQ int8. |
+| `export_cnn_small.py` | Export a small random-weight residual CNN (`model/cnn_small.onnx`) for the ml-float graph test. |
 | `export_quarot_onnx.py` | Export a QuaRot-rotated GPT-2 ONNX the prover can load directly. |
 | `fetch_eval_data.py` | Download the GPT-2 text eval sets into `model/eval/gpt2_eval/`. |
 

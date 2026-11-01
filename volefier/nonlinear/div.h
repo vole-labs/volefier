@@ -17,8 +17,9 @@ using namespace emp;
 //       t2 = D - 2N + 2qD  >= 0
 // Note  t1 + t2 = 2D  is a field identity, independent of q. So if BOTH t1 and
 // t2 are range-checked into [0, 2^B) with 2^(B+1) < PR, their integer sum is
-// forced to equal 2D, which pins each into [0, 2D] -> both >= 0 -> the rounding
-// is correct AND q is uniquely the honest round(N/D).
+// forced to equal 2D, which pins each into [0, 2D] -> both >= 0.  That alone fixes
+// q only modulo p (each in-range t1 admits its own huge field q), so q is also
+// committed as bounded limbs (commit_bounded); then q is uniquely round(N/D).
 //
 // Cost per division: ONE committed multiply (q*D) + TWO non-negative range
 // checks (chunked LogUp). No squaring (so no field wraparound) and, crucially,
@@ -38,6 +39,7 @@ public:
   IOChannel *io;
   std::size_t chunk_bits;   // LogUp range-table width (e.g. 12 -> table [0,2^12))
   std::size_t num_chunks;   // a range-checked term lies in [0, 2^(chunk_bits*num_chunks))
+  std::size_t range_bits;   // caller's bound 2*D < 2^range_bits (committed D)
   LogUpRangeCheck *rc = nullptr;
   bool flag_teardown = false;
   bool owns_rc = true;      // false when `rc` is borrowed (shared with e.g. QuantInfer::rc_rem)
@@ -46,7 +48,7 @@ public:
   // chunk_bits decomposition keeps the LogUp table small; the covered range is
   // rounded up to a multiple of chunk_bits and must stay below ~2^59.
   Div(int party, IOChannel *io, std::size_t range_bits, std::size_t chunk_bits = 12)
-      : party(party), io(io), chunk_bits(chunk_bits) {
+      : party(party), io(io), chunk_bits(chunk_bits), range_bits(range_bits) {
     num_chunks = (range_bits + chunk_bits - 1) / chunk_bits;
     rc = new LogUpRangeCheck(static_cast<uint64_t>(1) << chunk_bits, party, io);
     rc->Setup();
@@ -59,7 +61,7 @@ public:
   // `chunk_bits` MUST equal the shared table's width (log2 of its size).
   Div(int party, IOChannel *io, std::size_t range_bits, std::size_t chunk_bits,
       LogUpRangeCheck *shared_rc)
-      : party(party), io(io), chunk_bits(chunk_bits), owns_rc(false) {
+      : party(party), io(io), chunk_bits(chunk_bits), range_bits(range_bits), owns_rc(false) {
     num_chunks = (range_bits + chunk_bits - 1) / chunk_bits;
     rc = shared_rc;   // borrowed: already Setup by its owner, torn down by its owner
   }
@@ -76,6 +78,31 @@ public:
   static int64_t decode_signed(uint64_t v) {
     return (v > (PR >> 1)) ? static_cast<int64_t>(v) - static_cast<int64_t>(PR)
                            : static_cast<int64_t>(v);
+  }
+
+  // Commit q with |q| < 2^(qb-1) as limbs of q + 2^(qb-1), each in the range table, the top one
+  // also scaled by 2^(nq*chunk_bits - qb) so the limbs cover exactly [0, 2^qb).  With
+  // t1 in [0, 2D] and 2D < 2^B, (q, t1) is unique while 2^(qb+B) + 2^B < p, i.e. qb = 59 - B.
+  IntFp commit_bounded(int64_t qv, std::size_t qb) {
+    if (qb < 2) error("Div: divisor too wide for a bounded quotient\n");
+    const std::size_t nq = (qb + chunk_bits - 1) / chunk_bits;
+    const uint64_t off = static_cast<uint64_t>(1) << (qb - 1);
+    const uint64_t mask = (static_cast<uint64_t>(1) << chunk_bits) - 1;
+    const uint64_t topmul = static_cast<uint64_t>(1) << (nq * chunk_bits - qb);
+    uint64_t u = 0;
+    if (party == ALICE) {
+      if (qv < -static_cast<int64_t>(off) || qv >= static_cast<int64_t>(off))
+        error("Div: quotient exceeds its bound\n");
+      u = static_cast<uint64_t>(qv + static_cast<int64_t>(off));
+    }
+    IntFp q(PR - off, PUBLIC);
+    for (std::size_t k = 0; k < nq; ++k) {
+      IntFp l((u >> (chunk_bits * k)) & mask, ALICE);
+      rc->Access(l);
+      if (k == nq - 1 && topmul != 1) { IntFp t = l * topmul; rc->Access(t); }
+      q = q + l * (static_cast<int64_t>(1) << (chunk_bits * k));
+    }
+    return q;
   }
 
   // Prove a committed v lies in [0, 2^(chunk_bits*num_chunks)) by chunk
@@ -109,11 +136,9 @@ public:
       // round half away from zero (any q with |N - q*D| <= D/2 is accepted)
       int64_t qv = (Nv >= 0) ?  (Nv + Dv / 2) / Dv
                              : -(((-Nv) + Dv / 2) / Dv);
-      uint64_t raw = (qv >= 0) ? static_cast<uint64_t>(qv)
-                               : static_cast<uint64_t>(qv + static_cast<int64_t>(PR));
-      q = IntFp(raw, ALICE);
+      q = commit_bounded(qv, 59 - range_bits);   // a committed D is the caller's: 2D < 2^range_bits
     } else {
-      q = IntFp(static_cast<uint64_t>(0), ALICE);
+      q = commit_bounded(0, 59 - range_bits);
     }
 
     IntFp qD = q * D;                               // the only committed multiply
@@ -128,17 +153,16 @@ public:
   // q*D and D+... are mul_const/add-const (LOCAL) -- not the IntFp*IntFp mult-gate the committed-D
   // path takes.  Same rounding relation.
   IntFp round_div(IntFp N, uint64_t D) {
+    const std::size_t qb = 59 - (65 - __builtin_clzll(D));   // 2D < 2^(bitlen(D)+1)
     IntFp q;
     if (party == ALICE) {
       int64_t Nv = decode_signed(static_cast<uint64_t>(VAL(N.value)));
       int64_t Dv = (int64_t)D;
       int64_t qv = (Nv >= 0) ?  (Nv + Dv / 2) / Dv
                              : -(((-Nv) + Dv / 2) / Dv);
-      uint64_t raw = (qv >= 0) ? static_cast<uint64_t>(qv)
-                               : static_cast<uint64_t>(qv + static_cast<int64_t>(PR));
-      q = IntFp(raw, ALICE);
+      q = commit_bounded(qv, qb);
     } else {
-      q = IntFp(static_cast<uint64_t>(0), ALICE);
+      q = commit_bounded(0, qb);
     }
     IntFp qD = q * D;                                          // mul_const (local)
     IntFp t1 = N * 2LL + (qD * 2LL).negate() + IntFp(D, PUBLIC);   // D + 2N - 2qD >= 0

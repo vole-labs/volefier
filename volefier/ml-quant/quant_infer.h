@@ -8,6 +8,8 @@
 #include <vector>
 #include <cmath>
 #include <utility>
+#include <atomic>
+#include <algorithm>
 using namespace emp;
 
 // QuantInfer: building blocks for a VOLE-ZK proof of *quantized* neural-network
@@ -195,84 +197,64 @@ public:
     return {bc, be};
   }
 
-  // zkGPT roundLayer: prove q = round(acc * c / 2^M) by the TWO-SIDED RANGE
-  // relation (no advice remainder, no MSB).  With N = acc*c:
-  //   t1 = 2^M + 2N - q*2^(M+1) >= 0,   t2 = 2^M - 2N + q*2^(M+1) >= 0,
-  // and t1 + t2 = 2^(M+1) (constant), so range-checking both into [0, 2^(M+1))
-  // forces q = round(N / 2^M).  This is the c*2^e rescale: the rescale ratio
-  // S_in*S_w/S_out is searched to c*2^-M and applied here.
-  IntFp requant_cm_one(IntFp acc, uint64_t c, std::size_t M) const {
-    IntFp N = (c == 1) ? acc : acc * c;   // public scale: *uint64 = mul_const (local), not a mult-gate
-    if (M == 0) return N; // shift 0 -> identity (guards 1<<(M-1) underflow UB)
+  // Bound on a requant OUTPUT q: |q| < 2^(q_bits-1).  The floor relation Nb = q*2^Mpad + r
+  // with r in [0,2^Mpad) pins q only modulo p -- each in-range r admits its own (huge) field q --
+  // so q is committed as limbs of q + 2^(q_bits-1) instead of as a free witness (DeepProve's
+  // value + zeroing chunks).  Callers with wider outputs pass a larger bound per call.
+  std::size_t q_bits = 36;
+
+  // Effective q bound for shift Mpad: sound while 2^(qb+Mpad) < p, i.e. qb + Mpad <= 60.
+  std::size_t out_qbits(std::size_t Mpad, std::size_t qb) const {
+    if (Mpad + 2 > 60) error("requant: shift too large for a bounded output\n");
+    return std::min(qb ? qb : q_bits, 60 - Mpad);
+  }
+
+  // q = round-half-up(acc * c / 2^M).  ONE-SIDED requant (DeepProve-style): fold round-to-nearest
+  // into a +2^(M-1) bias and prove the floor by decomposing the DISCARDED low bits --
+  // Nb = q*2^Mpad + r, r in [0,2^Mpad) -- with the shift padded UP to a multiple of `precision`
+  // (scaling N by 2^pad, which cancels) so r decomposes into EXACT full chunks.  q itself is
+  // rebuilt from bounded limbs (see q_bits), so (q, r) is the unique solution.
+  IntFp requant_cm_one(IntFp acc, uint64_t c, std::size_t M, std::size_t qb = 0) const {
+    IntFp out;
+    requant_cm_batch(&out, &acc, c, M, 1, qb);
+    return out;
+  }
+
+  // BATCHED requant of a whole tensor at ONE (c, M).  Commits ALL limbs (remainder + bounded q)
+  // with ONE batch_feed and checks every floor with ONE batch_reveal_check_zero.  Public-constant
+  // scaling stays local (mul_const).
+  void requant_cm_batch(IntFp *out, const IntFp *acc, uint64_t c, std::size_t M,
+                        std::size_t n, std::size_t qb = 0) const {
+    if (n == 0) return;
+    if (M == 0) {  // identity (optional public scale)
+      for (std::size_t i = 0; i < n; ++i) out[i] = (c == 1) ? acc[i] : acc[i] * c;
+      return;
+    }
     // UPSCALE guard: callers pass M = (size_t)(-ce.second); when scale_search returns a POSITIVE
     // exponent (ratio>1, e.g. QDQ-int8 -> finer 2^-P) the shift is negative and the size_t cast
     // UNDERFLOWS to ~2^64.  An upscale by 2^e is an EXACT integer multiply (no rounding/range
     // check), so just multiply -- this is the BERT layer-1 bug (a negative shift broke the requant
     // gate).
     if (M > (static_cast<std::size_t>(1) << 40)) {
-      std::size_t up = static_cast<std::size_t>(0) - M; // up = -M = ce.second
-      return N * (static_cast<uint64_t>(1) << up);   // exact upscale: mul_const, not a mult-gate
-    }
-    // ONE-SIDED requant (DeepProve-style): fold round-to-nearest into a +2^(M-1) bias and prove the
-    // floor by decomposing the DISCARDED low bits -- Nb = q*2^Mpad + r, r in [0,2^Mpad) -- which
-    // needs ONE chunked range check instead of the previous TWO-sided |2N - q*2^(M+1)| <= 2^M.  The
-    // shift is padded UP to a multiple of `precision` (scaling N by 2^pad, which cancels) so r
-    // decomposes into EXACT full chunks (no boundary subtlety).  q = floor((N + 2^(M-1))/2^M) =
-    // round-half-up(N/2^M).
-    const std::size_t Mpad = ((M + precision - 1) / precision) * precision, pad = Mpad - M,
-                      nchunks = Mpad / precision;
-    IntFp Nb = (pad ? N * (static_cast<uint64_t>(1) << pad) : N) +   // pad scale: mul_const
-               IntFp(static_cast<uint64_t>(1) << (Mpad - 1), PUBLIC);
-    const uint64_t mask = (static_cast<uint64_t>(1) << precision) - 1;
-    IntFp q;
-    std::vector<IntFp> ch(nchunks);
-    if (party == ALICE) {
-      int64_t Nbv = decode_signed(static_cast<uint64_t>(VAL(Nb.value)));
-      int64_t qv = Nbv >> static_cast<int>(Mpad); // arithmetic floor (handles negatives)
-      uint64_t rv =
-          static_cast<uint64_t>(Nbv - (qv << static_cast<int>(Mpad))); // remainder in [0, 2^Mpad)
-      q = commit(qv);
-      for (std::size_t i = 0; i < nchunks; ++i)
-        ch[i] = commit(static_cast<int64_t>((rv >> (precision * i)) & mask));
-    } else {
-      q = IntFp(static_cast<uint64_t>(0), ALICE);
-      for (std::size_t i = 0; i < nchunks; ++i) ch[i] = IntFp(static_cast<uint64_t>(0), ALICE);
-    }
-    IntFp r(static_cast<uint64_t>(0), PUBLIC);
-    for (std::size_t i = 0; i < nchunks; ++i) {
-      rc_rem->Access(ch[i]);
-      r = r + ch[i] * (static_cast<int64_t>(1) << (precision * i));
-    }
-    (q * (static_cast<int64_t>(1) << static_cast<int>(Mpad)) + r + Nb.negate())
-        .reveal_zero(); // Nb == q*2^Mpad + r
-    return q;
-  }
-
-  // BATCHED requant of a whole tensor at ONE (c, M).  Same per-element math as
-  // requant_cm_one, but instead of committing q + nchunks chunks and revealing
-  // the floor PER ELEMENT (millions of per-element VOLE feeds + reveals, serial),
-  // it commits ALL q's and ALL chunks with TWO batch_feeds and checks every floor
-  // with ONE batch_reveal_check_zero.  Public-constant scaling stays local (mul_const).
-  void requant_cm_batch(IntFp *out, const IntFp *acc, uint64_t c, std::size_t M,
-                        std::size_t n) const {
-    if (n == 0) return;
-    if (M == 0) {  // identity (optional public scale)
-      for (std::size_t i = 0; i < n; ++i) out[i] = (c == 1) ? acc[i] : acc[i] * c;
-      return;
-    }
-    if (M > (static_cast<std::size_t>(1) << 40)) {  // upscale: exact integer multiply, no range check
       const uint64_t f = static_cast<uint64_t>(1) << (static_cast<std::size_t>(0) - M);
       for (std::size_t i = 0; i < n; ++i) out[i] = ((c == 1) ? acc[i] : acc[i] * c) * f;
       return;
     }
     const std::size_t Mpad = ((M + precision - 1) / precision) * precision,
                       pad = Mpad - M, nchunks = Mpad / precision;
+    const std::size_t QB = out_qbits(Mpad, qb), nq = (QB + precision - 1) / precision,
+                      nl = nchunks + nq; // limbs per element: remainder, then q + 2^(QB-1)
+    const uint64_t qoff = static_cast<uint64_t>(1) << (QB - 1);
+    // top q limb also looked up scaled by 2^(nq*precision - QB): the limbs then cover exactly
+    // [0, 2^QB) (DeepProve's shifted_chunk_multiplier)
+    const uint64_t topmul = static_cast<uint64_t>(1) << (nq * precision - QB);
     const uint64_t bias = static_cast<uint64_t>(1) << (Mpad - 1);
     const uint64_t mask = (static_cast<uint64_t>(1) << precision) - 1;
     const uint64_t padf = static_cast<uint64_t>(1) << pad;
     std::vector<IntFp> Nb(n);
-    std::vector<uint64_t> qraw(n, 0), chraw(n * nchunks, 0);
-    // Phase 1: local -- Nb[i], and (ALICE) the raw field q / chunk values.  All lane math
+    std::vector<uint64_t> chraw(n * nl, 0);
+    std::atomic<bool> overflow(false);
+    // Phase 1: local -- Nb[i], and (ALICE) the raw limb values.  All lane math
     // (mul_const/add) on DISJOINT indices -> threaded ONLY for large n: requant is called
     // ~300K times/run, mostly tiny (per-head/per-row) -- raw-thread spawn there cost ~300s.
     const int _rt = (n >= (std::size_t)1 << 16) ? mat_threads : 1;
@@ -283,37 +265,44 @@ public:
         int64_t Nbv = decode_signed(static_cast<uint64_t>(VAL(Nb[i].value)));
         int64_t qv = Nbv >> static_cast<int>(Mpad);
         uint64_t rv = static_cast<uint64_t>(Nbv - (qv << static_cast<int>(Mpad)));
-        qraw[i] = (qv >= 0) ? static_cast<uint64_t>(qv)
-                            : static_cast<uint64_t>(qv + static_cast<int64_t>(PR));
+        if (qv < -static_cast<int64_t>(qoff) || qv >= static_cast<int64_t>(qoff)) overflow = true;
+        const uint64_t u = static_cast<uint64_t>(qv + static_cast<int64_t>(qoff));
         for (std::size_t k = 0; k < nchunks; ++k)
-          chraw[i * nchunks + k] = (rv >> (precision * k)) & mask;
+          chraw[i * nl + k] = (rv >> (precision * k)) & mask;
+        for (std::size_t k = 0; k < nq; ++k)
+          chraw[i * nl + nchunks + k] = (u >> (precision * k)) & mask;
       }
     });
-    // Phase 2: TWO batched commits (q + all chunks) vs (1+nchunks)*n per-element feeds.
-    std::vector<IntFp> q(n), ch(n * nchunks);
-    batch_feed(q.data(), qraw.data(), (int64_t)n);
-    batch_feed(ch.data(), chraw.data(), (int64_t)(n * nchunks));
-    // Phase 3: range-check every chunk, rebuild the floor, ONE batched zero-check.
+    if (overflow) error("requant: output exceeds q_bits -- pass a wider bound at this call site\n");
+    // Phase 2: ONE batched commit of every limb.
+    std::vector<IntFp> ch(n * nl);
+    batch_feed(ch.data(), chraw.data(), (int64_t)(n * nl));
+    // Phase 3: rebuild r and q from their limbs, ONE batched zero-check of the floor.
     std::vector<IntFp> zchk(n);
     const int64_t two_Mpad = static_cast<int64_t>(1) << static_cast<int>(Mpad);
+    const IntFp negoff(PR - qoff, PUBLIC);
     // reconstruction lane math on disjoint indices -> threaded; the Access() pushes stay in a
-    // SERIAL loop (shared witness buffer + possible auto-teardown), same witness order as before.
+    // SERIAL loop (shared witness buffer + possible auto-teardown).
     volefier::parallel_for(n, _rt, [&](std::size_t i) {
-      IntFp r(static_cast<uint64_t>(0), PUBLIC);
+      IntFp r(static_cast<uint64_t>(0), PUBLIC), q = negoff;
       for (std::size_t k = 0; k < nchunks; ++k)
-        r = r + ch[i * nchunks + k] * (static_cast<int64_t>(1) << (precision * k));
-      zchk[i] = q[i] * two_Mpad + r + Nb[i].negate();  // must equal 0: Nb == q*2^Mpad + r
-      out[i] = q[i];
+        r = r + ch[i * nl + k] * (static_cast<int64_t>(1) << (precision * k));
+      for (std::size_t k = 0; k < nq; ++k)
+        q = q + ch[i * nl + nchunks + k] * (static_cast<int64_t>(1) << (precision * k));
+      zchk[i] = q * two_Mpad + r + Nb[i].negate();  // must equal 0: Nb == q*2^Mpad + r
+      out[i] = q;
     });
-    for (std::size_t i = 0; i < n; ++i)
-      for (std::size_t k = 0; k < nchunks; ++k) rc_rem->Access(ch[i * nchunks + k]);
+    for (std::size_t i = 0; i < n; ++i) {
+      for (std::size_t k = 0; k < nl; ++k) rc_rem->Access(ch[i * nl + k]);
+      if (topmul != 1) { IntFp t = ch[i * nl + nl - 1] * topmul; rc_rem->Access(t); }
+    }
     batch_reveal_check_zero(zchk.data(), (int64_t)n);
   }
 
   void requant_cm(std::vector<IntFp> &out, const std::vector<IntFp> &acc, uint64_t c,
-                  std::size_t M) const {
+                  std::size_t M, std::size_t qb = 0) const {
     out.resize(acc.size());
-    requant_cm_batch(out.data(), acc.data(), c, M, acc.size());
+    requant_cm_batch(out.data(), acc.data(), c, M, acc.size(), qb);
   }
 
   // Re-quantization after a weight matmul: rescale ratio = wc*2^-precision.

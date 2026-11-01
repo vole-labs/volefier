@@ -35,16 +35,17 @@ inline IntFp prove_rsqrt(RangeCheckLU *rc, int party, const IntFp &var, int P, i
     sv = (X - r * r > r) ? r + 1 : r;     // round: X > r^2 + r  <=>  sqrt(X) > r + 1/2
   }
   IntFp s(sv, ALICE), dinv(dv, ALICE);
-  rc->check(var, var_bits);
-  rc->check(s, Sb);
-  rc->check(dinv, Db);
+  // exact widths: the 16-bit table would otherwise accept s up to 2^32, and s^2 then wraps
+  rc->check_exact(var, var_bits);
+  rc->check_exact(s, Sb);
+  rc->check_exact(dinv, Db);
   IntFp e = var * (1ULL << (2 * K)) + (s * s).negate();   // var * 2^2K - s^2
-  rc->check(s + e, Sb + 1);
-  rc->check(s + e.negate(), Sb + 1);
+  rc->check_exact(s + e, Sb + 1);
+  rc->check_exact(s + e.negate(), Sb + 1);
   IntFp m2 = (dinv * s + IntFp(1ULL << (2 * P + K), PUBLIC).negate()) * 2LL;
   IntFp w = s + dinv + IntFp(static_cast<uint64_t>(4), PUBLIC);
-  rc->check(w + m2, Bm);
-  rc->check(w + m2.negate(), Bm);
+  rc->check_exact(w + m2, Bm);
+  rc->check_exact(w + m2.negate(), Bm);
   return dinv;
 }
 

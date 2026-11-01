@@ -89,15 +89,24 @@ public:
   // single-element feeds) and the n reconstruction identities close with ONE batched
   // zero-check.  Same bytes on the wire (the limb corrections are needed either way);
   // the saving is the per-call feed/check overhead at tens of millions of elements.
-  void check_batch(const IntFp *v, std::size_t n, std::size_t bit_length) {
+  //
+  // exact = true: check [0, 2^bit_length) itself -- the top limb is also looked up scaled by
+  // 2^(nchunks*table_bits - bit_length).  Needed where a relation's wrap-freeness rests on the
+  // stated width (e.g. s^2 < p in prove_rsqrt); a sign test is fine with the rounded-up range.
+  void check_batch(const IntFp *v, std::size_t n, std::size_t bit_length, bool exact = false) {
     if (n == 0) return;
     const std::size_t nchunks = num_lookups(bit_length);
     if (nchunks * table_bits >= 64 ||
         (static_cast<__uint128_t>(1) << (nchunks * table_bits)) >= static_cast<__uint128_t>(PR))
       error("RangeCheckLU::check_batch: 2^(nchunks*table_bits) >= field size -> vacuous range check; "
             "reduce operand_bits (with a 16-bit table the max sound bit_length is 48, i.e. operand_bits <= 47)\n");
+    const std::size_t sh = nchunks * table_bits - bit_length;
+    const bool top = exact && bit_length > 0 && sh > 0;
     if (nchunks <= 1) {
-      for (std::size_t i = 0; i < n; ++i) { IntFp t = v[i]; table->Access(t); }
+      for (std::size_t i = 0; i < n; ++i) {
+        IntFp t = v[i]; table->Access(t);
+        if (top) { IntFp u = v[i] * (static_cast<uint64_t>(1) << sh); table->Access(u); }
+      }
       return;
     }
     const uint64_t mask = table_size - 1;
@@ -118,11 +127,16 @@ public:
         recon = recon + ch[i * nchunks + k] * (static_cast<uint64_t>(1) << (table_bits * k));
       zchk[i] = recon + v[i].negate();
     });
-    for (std::size_t i = 0; i < n; ++i)                          // SERIAL: shared witness buffer,
+    for (std::size_t i = 0; i < n; ++i) {                        // SERIAL: shared witness buffer,
       for (std::size_t k = 0; k < nchunks; ++k)                  // same witness order as before
         table->Access(ch[i * nchunks + k]);
+      if (top) { IntFp u = ch[i * nchunks + nchunks - 1] * (static_cast<uint64_t>(1) << sh); table->Access(u); }
+    }
     batch_reveal_check_zero(zchk.data(), (int64_t)n);            // limbs reconstruct each v
   }
+
+  // v in exactly [0, 2^bit_length) (see check_batch's exact).
+  void check_exact(const IntFp &v, std::size_t bit_length) { check_batch(&v, 1, bit_length, true); }
 };
 
 #endif

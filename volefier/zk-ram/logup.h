@@ -168,13 +168,20 @@ public:
     //             If max_val == 0, caller provides no bound and x is sampled
     //             from the full field — completeness may fail with probability
     //             (W+T)/PR (negligible for PR ≈ 2^61).
+    // identity = true: the table is the PUBLIC set {0, ..., table_sz-1} and `table` may be empty.
+    // Its inverses 1/(x+j) are then public, so the table side only commits the multiplicities and
+    // checks  sum_i inv_i = sum_j m_j/(x+j)  as a local linear combination (no T committed
+    // inverses, no (x+t)*inv==1 checks) -- the dominant table cost for a wide range table.
     void Prove(const std::vector<IntFp> &witnesses,
                const std::vector<IntFp> &table,
                const std::vector<uint64_t> &mult_raw,
-               uint64_t table_sz = 0) {
+               uint64_t table_sz = 0, bool identity = false) {
 
         std::size_t W = witnesses.size();
-        std::size_t T = table.size();
+        std::size_t T = identity ? table_sz : table.size();
+        auto tval = [&](std::size_t j) -> uint64_t {
+            return identity ? static_cast<uint64_t>(j) : static_cast<uint64_t>(VAL(table[j].value));
+        };
 
         // Step 1: Prover commits multiplicities -- ONE batched feed (bulk VOLE + one send)
         // straight into the IntFp array, instead of T per-element IntFp(.,ALICE) feeds.
@@ -231,7 +238,7 @@ public:
             std::vector<uint64_t> tvals(T), den(T), invs(T);
             uint64_t max_tv = 0;
             for (std::size_t j = 0; j < T; ++j) {
-                tvals[j] = static_cast<uint64_t>(VAL(table[j].value));
+                tvals[j] = tval(j);
                 if (tvals[j] > max_tv) max_tv = tvals[j];
                 den[j] = mod(x_val + tvals[j]);
             }
@@ -373,6 +380,18 @@ public:
             // ivw / inv_own / denom_own freed here (non-INVBATCH) -> witness-side peak stays ~O(B)
         }
 
+        // Public identity table: sum_j m_j * (1/(x+j)) with public coefficients is a local linear
+        // combination of the committed multiplicities; one zero-opening closes the identity.
+        if (identity) {
+            LogUpSpan _sp_tab(LP_TABLE, io);
+            std::vector<uint64_t> den(T), inv(T);
+            for (std::size_t j = 0; j < T; ++j) den[j] = mod(x_val + j);
+            logup_detail::batch_mod_inv(den.data(), inv.data(), T);
+            IntFp acc = sum.negate();
+            for (std::size_t j = 0; j < T; ++j) acc = acc + multiplicities[j] * inv[j];
+            acc.reveal_zero();   // sum_j m_j/(x+j) - sum_i 1/(x+w_i) == 0
+            return;
+        }
         // Table side (T = table size, small -- unchanged): commit T inverses, subtract m_j/(x+t_j).
         {
             LogUpSpan _sp_tab(LP_TABLE, io);
@@ -690,15 +709,12 @@ public:
         double _c0 = LPROF ? logup_cpu_self() : 0, _h0 = LPROF ? logup_cpu_thr() : 0;
         unsigned long long _r0 = LPROF ? static_cast<NetIO *>(io)->rounds : 0ULL;
 
-        std::vector<IntFp> table(N);
-        for (uint64_t i = 0; i < N; ++i)
-            table[i] = IntFp(i, PUBLIC);
-
         LogUpLookup logup(party, io);
         // All table and witness values are in [0, N) by construction (table
         // is {0, ..., N-1} and witnesses are range-checked against it), so
         // x is sampled from [1, PR - N] and zero denominators are impossible.
-        logup.Prove(witnesses, table, mult_raw, N);
+        // The table is the public identity range, passed implicitly.
+        logup.Prove(witnesses, {}, mult_raw, N, /*identity=*/true);
 
         witnesses.clear();
         mult_raw.assign(N, 0ULL);

@@ -44,6 +44,14 @@ public:
   // avoids a large 2^(out_bits+1) table, whose committed multiplicities used to
   // dominate the teardown.
   LogUpRangeCheck *rc_rem = nullptr;
+  // Wide requant range table [0, 2^wide_bits), wide_bits = 2*precision (24 at P=12): ONE lookup
+  // covers a requant output q (q_bits = 24) or a 24-bit remainder, where 12-bit limbs need two.
+  // Requant limbs dominate the ml-quant proof (~80% of BERT's traffic), so this halves most of
+  // them; the table's multiplicities are committed once per batch, hence the larger batch
+  // (LOGUP_WIDE_BATCH, default 64M lookups ~ 1 GB of buffered witnesses per party).  Not used
+  // when 2*precision > 24 (the table would be too large).
+  LogUpRangeCheck *rc_wide = nullptr;
+  std::size_t wide_bits = 0;
   // zkGPT-style weight scale mantissa: weights live at scale wc*2^-precision, so
   // a dense layer's rescale ratio is wc*2^-precision (c = wc, not 1). Activations
   // stay at 2^-precision (c=1) for residual-stream consistency.
@@ -61,6 +69,13 @@ public:
         mat_threads(mat_threads_) {
     rc_rem = new LogUpRangeCheck(static_cast<uint64_t>(1) << precision, party, io);
     rc_rem->Setup();
+    if (2 * precision <= 24) {
+      wide_bits = 2 * precision;
+      uint64_t wb = (uint64_t)64 << 20;
+      if (const char *e = getenv("LOGUP_WIDE_BATCH")) { uint64_t v = strtoull(e, nullptr, 10); if (v) wb = v; }
+      rc_wide = new LogUpRangeCheck(static_cast<uint64_t>(1) << wide_bits, party, io, wb);
+      rc_wide->Setup();
+    }
     ipp = new volefier::IPProof<BoolIO>(party, bio,
                                                volefier::get_ostriple(party));
     // Shared process-global Hadamard2IP: batches every RLC-then-IP claim's chi challenge --
@@ -85,6 +100,11 @@ public:
     rc_rem->Teardown();
     delete rc_rem;
     rc_rem = nullptr;
+    if (rc_wide) {
+      rc_wide->Teardown();
+      delete rc_wide;
+      rc_wide = nullptr;
+    }
     // Flush the shared Hadamard2IP AFTER the last teardown fed it (bitness during run() +
     // LogUp inverse checks), before finalize_zk_arith() runs FpPolyProof's batch_check.
     if (volefier::global_h2ip()) {
@@ -201,8 +221,8 @@ public:
   // with r in [0,2^Mpad) pins q only modulo p -- each in-range r admits its own (huge) field q --
   // so q is committed as limbs of q + 2^(q_bits-1) instead of as a free witness (DeepProve's
   // value + zeroing chunks).  Callers with wider outputs pass a larger bound per call.  24 bits
-  // (two 12-bit limbs) covers the int12 activations and logits; honest GPT-2 / BERT outputs peak
-  // near 20 bits.
+  // (one lookup in the wide table) covers the int12 activations and logits; honest GPT-2 / BERT
+  // outputs peak near 20 bits.
   std::size_t q_bits = 24;
 
   // Effective q bound for shift Mpad: sound while 2^(qb+Mpad) < p, i.e. qb + Mpad <= 60.
@@ -242,16 +262,26 @@ public:
       for (std::size_t i = 0; i < n; ++i) out[i] = ((c == 1) ? acc[i] : acc[i] * c) * f;
       return;
     }
-    const std::size_t Mpad = ((M + precision - 1) / precision) * precision,
-                      pad = Mpad - M, nchunks = Mpad / precision;
-    const std::size_t QB = out_qbits(Mpad, qb), nq = (QB + precision - 1) / precision,
-                      nl = nchunks + nq; // limbs per element: remainder, then q + 2^(QB-1)
+    const std::size_t Mpad = ((M + precision - 1) / precision) * precision, pad = Mpad - M;
+    const std::size_t QB = out_qbits(Mpad, qb);
+    // Limb widths per element, low to high: the remainder r (exactly Mpad bits: wide limbs, then
+    // precision-bit ones), then q + 2^(QB-1) (wide limbs when available, else precision-bit).
+    const std::size_t W = wide_bits ? wide_bits : precision;
+    std::vector<std::size_t> lw;
+    std::size_t rb = 0;
+    if (wide_bits) for (; rb + W <= Mpad; rb += W) lw.push_back(W);
+    for (; rb < Mpad; rb += precision) lw.push_back(precision);
+    const std::size_t nr = lw.size();
+    const std::size_t nq = (QB + W - 1) / W;
+    for (std::size_t k = 0; k < nq; ++k) lw.push_back(W);
+    const std::size_t nl = lw.size();
+    std::vector<std::size_t> lo(nl);   // bit offset of each limb within its value
+    for (std::size_t k = 0, o = 0; k < nl; ++k) { if (k == nr) o = 0; lo[k] = o; o += lw[k]; }
     const uint64_t qoff = static_cast<uint64_t>(1) << (QB - 1);
-    // top q limb also looked up scaled by 2^(nq*precision - QB): the limbs then cover exactly
-    // [0, 2^QB) (DeepProve's shifted_chunk_multiplier)
-    const uint64_t topmul = static_cast<uint64_t>(1) << (nq * precision - QB);
+    // top q limb also looked up scaled by 2^(nq*W - QB): the limbs then cover exactly [0, 2^QB)
+    // (DeepProve's shifted_chunk_multiplier)
+    const uint64_t topmul = static_cast<uint64_t>(1) << (nq * W - QB);
     const uint64_t bias = static_cast<uint64_t>(1) << (Mpad - 1);
-    const uint64_t mask = (static_cast<uint64_t>(1) << precision) - 1;
     const uint64_t padf = static_cast<uint64_t>(1) << pad;
     std::vector<IntFp> Nb(n);
     std::vector<uint64_t> chraw(n * nl, 0);
@@ -269,10 +299,8 @@ public:
         uint64_t rv = static_cast<uint64_t>(Nbv - (qv << static_cast<int>(Mpad)));
         if (qv < -static_cast<int64_t>(qoff) || qv >= static_cast<int64_t>(qoff)) overflow = true;
         const uint64_t u = static_cast<uint64_t>(qv + static_cast<int64_t>(qoff));
-        for (std::size_t k = 0; k < nchunks; ++k)
-          chraw[i * nl + k] = (rv >> (precision * k)) & mask;
-        for (std::size_t k = 0; k < nq; ++k)
-          chraw[i * nl + nchunks + k] = (u >> (precision * k)) & mask;
+        for (std::size_t k = 0; k < nl; ++k)
+          chraw[i * nl + k] = ((k < nr ? rv : u) >> lo[k]) & ((static_cast<uint64_t>(1) << lw[k]) - 1);
       }
     });
     if (overflow) error("requant: output exceeds q_bits -- pass a wider bound at this call site\n");
@@ -287,16 +315,14 @@ public:
     // SERIAL loop (shared witness buffer + possible auto-teardown).
     volefier::parallel_for(n, _rt, [&](std::size_t i) {
       IntFp r(static_cast<uint64_t>(0), PUBLIC), q = negoff;
-      for (std::size_t k = 0; k < nchunks; ++k)
-        r = r + ch[i * nl + k] * (static_cast<int64_t>(1) << (precision * k));
-      for (std::size_t k = 0; k < nq; ++k)
-        q = q + ch[i * nl + nchunks + k] * (static_cast<int64_t>(1) << (precision * k));
+      for (std::size_t k = 0; k < nr; ++k) r = r + ch[i * nl + k] * (static_cast<int64_t>(1) << lo[k]);
+      for (std::size_t k = nr; k < nl; ++k) q = q + ch[i * nl + k] * (static_cast<int64_t>(1) << lo[k]);
       zchk[i] = q * two_Mpad + r + Nb[i].negate();  // must equal 0: Nb == q*2^Mpad + r
       out[i] = q;
     });
     for (std::size_t i = 0; i < n; ++i) {
-      for (std::size_t k = 0; k < nl; ++k) rc_rem->Access(ch[i * nl + k]);
-      if (topmul != 1) { IntFp t = ch[i * nl + nl - 1] * topmul; rc_rem->Access(t); }
+      for (std::size_t k = 0; k < nl; ++k) (lw[k] == precision ? rc_rem : rc_wide)->Access(ch[i * nl + k]);
+      if (topmul != 1) { IntFp t = ch[i * nl + nl - 1] * topmul; (W == precision ? rc_rem : rc_wide)->Access(t); }
     }
     batch_reveal_check_zero(zchk.data(), (int64_t)n);
   }

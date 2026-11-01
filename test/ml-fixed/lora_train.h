@@ -31,7 +31,8 @@
 // default 8), GRAD_BITS (extra precision of dL/dW_eff, default 8, must be < P), LR (default 1e-2
 // for SGD, 1e-3 for AdamW), ADAM_B1 / ADAM_B2 / ADAM_EPS / WD (AdamW, default 0.9 / 0.999 /
 // 1e-8 / 0.01), ADAM_GRAD_BITS (fractional bits of the AdamW gradient, default 28: gradients
-// up to 2^(29-bits) in magnitude), ALPHA (default 2*RANK), LSE (LogSumExp attention
+// up to 2^(29-bits) in magnitude; gradients only a few units of 2^-bits get coarse AdamW updates,
+// so raise it when the gradients are small -- the random medium model needs ~36), ALPHA (default 2*RANK), LSE (LogSumExp attention
 // softmax, default 1; 0 = the division softmax), HEAD_EXP_BITS (extra output bits of the head's
 // exp table, default 12), ATTN_EXP_BITS (extra output bits of the LSE attention softmax, default
 // 8), GPT2_BIN, TOKENS, CHECK, ZK_THREADS, PEER_IP.
@@ -524,6 +525,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       size_t nzB = 0, nzA = 0, nB = 0, nA = 0;
       double hr = 0; // largest |requant input| of the gradient rescale, log2 (must stay < 59)
       double gtop = 0; // largest |AdamW gradient|
+      size_t glow = 0, gnz = 0; // nonzero AdamW gradients, and those under 32 units (coarse there)
       for (int b = 0; b < NB; ++b) {
         if (!adam) {
           vector<IntFp> Bq2, Aq2, Bv2, Av2;
@@ -574,7 +576,10 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
             if (party == ALICE) { // the gradient must fit the AdamW window (prover-side, before proving)
               const FixedAdamW::StepConst kc = adam->consts(gscale, step + 1);
               double gmax = 0;
-              for (auto &z : raw[j]) gmax = max(gmax, fabs((double)dq(z)) * kc.cg / std::ldexp(1.0, (int)kc.Mg));
+              for (auto &z : raw[j]) {
+                const double gi = fabs((double)dq(z)) * kc.cg / std::ldexp(1.0, (int)kc.Mg);
+                gmax = max(gmax, gi); gnz += gi >= 0.5; glow += gi >= 0.5 && gi < 32;
+              }
               if (gmax >= std::ldexp(1.0, 29)) error("AdamW: |gradient| exceeds the ADAM_GRAD_BITS window -- lower ADAM_GRAD_BITS\n");
               gtop = max(gtop, gmax / std::ldexp(1.0, (int)adam->Fg));
             }
@@ -628,7 +633,8 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       if (CHECK && party == ALICE)
         printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%) | gradient rescale input up to 2^%.1f (limit 2^59)%s\n",
                step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA, hr,
-               adam ? (" | max |g| " + to_string(gtop)).c_str() : "");
+               adam ? (" | max |g| " + to_string(gtop) + ", " + to_string(gnz ? 100.0 * glow / gnz : 0.0) +
+                       "% of gradients under 32 units (raise ADAM_GRAD_BITS if large)").c_str() : "");
       printf("[%d] step %d done: W_eff+forward %.1fs, head %.1fs, backward %.1fs, %s %.1fs (wall incl. prover checks)\n",
              party, step, t_fwd, t_head, t_bwd, adam ? "AdamW" : "SGD", t_opt);
     }

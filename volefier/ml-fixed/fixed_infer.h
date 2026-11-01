@@ -234,6 +234,11 @@ public:
     volefier::parallel_for(n, rt, [&](std::size_t i) {
       N[i] = (c == 1) ? acc[i] : acc[i] * c;   // public scale: mul_const
       if (party == ALICE) {
+        // acc * c must not wrap the field: past 2^60 the proof still holds, for the wrapped value
+        if (c != 1) {
+          const __int128 a = decode_signed(static_cast<uint64_t>(VAL(acc[i].value)));
+          if ((a < 0 ? -a : a) * c >= ((__int128)1 << 60)) overflow = true;
+        }
         const int64_t Nb = decode_signed(static_cast<uint64_t>(VAL(N[i].value))) + half;
         const int64_t qv = Nb >> static_cast<int>(M);   // arithmetic floor
         const uint64_t rv = static_cast<uint64_t>(Nb - (qv << static_cast<int>(M)));
@@ -244,7 +249,7 @@ public:
         for (std::size_t k = 0; k < nq; ++k) l[nr + k] = (u >> (precision * k)) & mask;
       }
     });
-    if (overflow) error("requant: output exceeds q_bits -- pass a wider bound at this call site\n");
+    if (overflow) error("requant: output exceeds q_bits, or acc * c reaches 2^60 -- widen the bound or reduce the scale\n");
     // Phase 2: ONE batched commit of every limb.
     std::vector<IntFp> ch(n * nl);
     batch_feed(ch.data(), raw.data(), static_cast<int64_t>(n * nl));

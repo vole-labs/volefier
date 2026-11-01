@@ -346,8 +346,7 @@ int main(int argc, char **argv)
     // ================= CHECK (ALICE) =================
     if (party == ALICE)
     {
-      auto rha = [&](int64_t N) -> int64_t
-      { int64_t hf = 1LL << (P - 1), Dn = 1LL << P; return (N >= 0) ? (N + hf) / Dn : -(((-N) + hf) / Dn); };
+      auto rhu = [&](int64_t N) -> int64_t { return (N + (1LL << (P - 1))) >> P; };   // round-half-up: FixedInfer::requant_cm
       // --- loss head: softmax sanity + exact ---
       double mx = -1e30, sum = 0, pf[vocab];
       for (int v = 0; v < vocab; ++v)
@@ -379,7 +378,7 @@ int main(int argc, char **argv)
         int64_t acc = 0;
         for (int v = 0; v < vocab; ++v)
           acc += q1(We[v][k]) * dl_q[v];
-        if (dHlast_q[k] != rha(acc))
+        if (dHlast_q[k] != rhu(acc))
         {
           printf("[%d] dLdHlast[%d] MISMATCH\n", party, k);
           ok = false;
@@ -387,7 +386,7 @@ int main(int argc, char **argv)
       }
       for (int v = 0; v < vocab; ++v)
         for (int k = 0; k < d; ++k)
-          if (dWe_q[v * d + k] != rha(dl_q[v] * (int64_t)llround(outLastr[k] * SCALE)))
+          if (dWe_q[v * d + k] != rhu(dl_q[v] * (int64_t)llround(outLastr[k] * SCALE)))
           {
             printf("[%d] dLdWe[%d][%d] MISMATCH\n", party, v, k);
             ok = false;
@@ -555,7 +554,7 @@ int main(int argc, char **argv)
       // --- SGD exact ---
       for (int a2 = 0; a2 < d; ++a2)
         for (int b = 0; b < d; ++b)
-          if (Wqn_q[a2 * d + b] != q1(Wq[a2][b]) - rha((int64_t)lr_q * dWq_q[a2 * d + b]))
+          if (Wqn_q[a2 * d + b] != q1(Wq[a2][b]) - rhu((int64_t)lr_q * dWq_q[a2 * d + b]))
           {
             printf("[%d] Wq_new[%d][%d] MISMATCH\n", party, a2, b);
             ok = false;
@@ -563,12 +562,12 @@ int main(int argc, char **argv)
       for (int v = 0; v < vocab; ++v)
       {
         for (int k = 0; k < d; ++k)
-          if (Wen_q[v * d + k] != q1(We[v][k]) - rha((int64_t)lr_q * dWe_q[v * d + k]))
+          if (Wen_q[v * d + k] != q1(We[v][k]) - rhu((int64_t)lr_q * dWe_q[v * d + k]))
           {
             printf("[%d] We_new[%d][%d] MISMATCH\n", party, v, k);
             ok = false;
           }
-        if (ben_q[v] != q1(be[v]) - rha((int64_t)lr_q * dbe_q[v]))
+        if (ben_q[v] != q1(be[v]) - rhu((int64_t)lr_q * dbe_q[v]))
         {
           printf("[%d] be_new[%d] MISMATCH\n", party, v);
           ok = false;

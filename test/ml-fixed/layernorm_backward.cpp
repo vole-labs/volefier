@@ -6,7 +6,7 @@
 //   dL/dbeta_i  = dL/dy_i
 //   dL/dx_i     = dinv*( g_i - mean(g) - x_hat_i*mean(g (.) x_hat) ),  g = dL/dy (.) gamma
 // c, gamma, dinv, dL/dy are committed as IntFp; the revealed gradients are checked
-// EXACTLY against a fixed-point replay (same round-half-away requant + Div rounding)
+// EXACTLY against a fixed-point replay (same round-half-up requant + Div rounding)
 // and cross-checked (within tolerance) against the float LayerNorm-backward reference.
 // Setup mirrors test/ml-fixed/gelu_backward.cpp / rmsnorm_backward.cpp.
 #include <iostream>
@@ -59,11 +59,8 @@ int main(int argc, char **argv) {
       dLdy_int[i] = llround(dLdy_f[i] * SCALE);
     }
 
-    // round-half-away helpers (mirror FixedInfer::requant_cm and Div::round_div)
-    auto rha = [&](int64_t Nn) -> int64_t { // requant by 2^P
-      int64_t h = 1LL << (P - 1), Dn = 1LL << P;
-      return (Nn >= 0) ? (Nn + h) / Dn : -(((-Nn) + h) / Dn);
-    };
+    // rounding helpers: FixedInfer::requant_cm (round-half-up) and Div::round_div (half away)
+    auto rhu = [&](int64_t Nn) -> int64_t { return (Nn + (1LL << (P - 1))) >> P; }; // requant by 2^P
     auto rdiv = [&](int64_t Nn, int64_t Dn) -> int64_t { // round_div by Dn (half away)
       int64_t h = Dn / 2;
       return (Nn >= 0) ? (Nn + h) / Dn : -(((-Nn) + h) / Dn);
@@ -80,18 +77,18 @@ int main(int argc, char **argv) {
 
     // -------- EXACT fixed-point reference (mirror of the gadget) --------
     vector<int64_t> y_ref(N), dgamma_ref(N), dbeta_ref(N), g_ref(N), dx_ref(N);
-    for (int i = 0; i < N; ++i) y_ref[i] = rha(c_int[i] * dinv_int);            // x_hat
-    for (int i = 0; i < N; ++i) dgamma_ref[i] = rha(dLdy_int[i] * y_ref[i]);
+    for (int i = 0; i < N; ++i) y_ref[i] = rhu(c_int[i] * dinv_int);            // x_hat
+    for (int i = 0; i < N; ++i) dgamma_ref[i] = rhu(dLdy_int[i] * y_ref[i]);
     for (int i = 0; i < N; ++i) dbeta_ref[i] = dLdy_int[i];                     // free
-    for (int i = 0; i < N; ++i) g_ref[i] = rha(dLdy_int[i] * gamma_int[i]);
+    for (int i = 0; i < N; ++i) g_ref[i] = rhu(dLdy_int[i] * gamma_int[i]);
     int64_t gy = 0; for (int i = 0; i < N; ++i) gy += g_ref[i] * y_ref[i];
     int64_t dot1 = rdiv(gy, (int64_t)n << P);                                   // <g,y>/n
     int64_t sum_g = 0; for (int i = 0; i < N; ++i) sum_g += g_ref[i];
     int64_t dot2 = rdiv(sum_g, (int64_t)n);                                     // mean(g)
     for (int i = 0; i < N; ++i) {
-      int64_t yp = rha(y_ref[i] * dot1);
+      int64_t yp = rhu(y_ref[i] * dot1);
       int64_t term = g_ref[i] - dot2 - yp;
-      dx_ref[i] = rha(dinv_int * term);
+      dx_ref[i] = rhu(dinv_int * term);
     }
 
     // -------- float reference (true LayerNorm backward, sanity cross-check) --------

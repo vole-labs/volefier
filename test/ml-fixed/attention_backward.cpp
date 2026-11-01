@@ -2,7 +2,7 @@
 // Retained forward tensors Q,K,V (2^-P), per (token,head) softmax probs (2^-P),
 // ctx (2^-2P), Wo, and upstream dL/dOut (2^-P) are committed directly; the gadget
 // produces dL/dH, dL/dQ, dL/dK, dL/dV (2^-P) and dL/dWo (flat, 2^-P).
-// Outputs are checked EXACTLY against a fixed-point replay (same round-half-away
+// Outputs are checked EXACTLY against a fixed-point replay (same round-half-up
 // requant + causal mask) and cross-checked against a float attention-backward
 // reference within tolerance.  Setup mirrors test/ml-fixed/gelu_backward.cpp.
 #include <iostream>
@@ -86,10 +86,7 @@ int main(int argc, char **argv) {
       }
 
     // ============ EXACT fixed-point reference (mirror of the gadget) ============
-    auto rha = [&](int64_t N, int M) -> int64_t { // round-half-away by 2^M
-      int64_t half = 1LL << (M - 1), Dn = 1LL << M;
-      return (N >= 0) ? (N + half) / Dn : -(((-N) + half) / Dn);
-    };
+    auto rhu = [&](int64_t N, int M) -> int64_t { return (N + (1LL << (M - 1))) >> M; }; // round-half-up by 2^M
     vector<vector<int64_t>> dQref(s, vector<int64_t>(d, 0)), dKref(s, vector<int64_t>(d, 0)),
         dVref(s, vector<int64_t>(d, 0)), dHref(s, vector<int64_t>(d, 0));
     vector<int64_t> dWoref(d * d, 0);
@@ -108,21 +105,21 @@ int main(int argc, char **argv) {
         // 2a
         vector<int64_t> dCtx_h(dh); for (int k = 0; k < dh; ++k) dCtx_h[k] = dCtxr[i][off + k];
         vector<int64_t> dprobsP(L), dprobs_h(L);
-        for (int j = 0; j < L; ++j) { int64_t acc = 0; for (int k = 0; k < dh; ++k) acc += dCtx_h[k] * Vi[j][off + k]; dprobs_h[j] = acc; dprobsP[j] = rha(acc, 2 * P); }
-        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dVref[j][off + k] += rha(pri[i][hh][j] * dCtx_h[k], 2 * P);
+        for (int j = 0; j < L; ++j) { int64_t acc = 0; for (int k = 0; k < dh; ++k) acc += dCtx_h[k] * Vi[j][off + k]; dprobs_h[j] = acc; dprobsP[j] = rhu(acc, 2 * P); }
+        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dVref[j][off + k] += rhu(pri[i][hh][j] * dCtx_h[k], 2 * P);
         // 2b softmax general
         int64_t dot2p = 0; for (int j = 0; j < L; ++j) dot2p += pri[i][hh][j] * dprobsP[j];
-        int64_t dotP = rha(dot2p, P);
+        int64_t dotP = rhu(dot2p, P);
         vector<int64_t> dScores(L);
-        for (int j = 0; j < L; ++j) dScores[j] = rha(pri[i][hh][j] * (dprobsP[j] - dotP), P);
+        for (int j = 0; j < L; ++j) dScores[j] = rhu(pri[i][hh][j] * (dprobsP[j] - dotP), P);
         // 2c undo 1/sqrt(dh)
-        vector<int64_t> dSc(L); for (int j = 0; j < L; ++j) dSc[j] = rha(dScores[j] * (int64_t)qinv, P);
+        vector<int64_t> dSc(L); for (int j = 0; j < L; ++j) dSc[j] = rhu(dScores[j] * (int64_t)qinv, P);
         // 2d Q@Kt
-        for (int k = 0; k < dh; ++k) { int64_t acc = 0; for (int j = 0; j < L; ++j) acc += dSc[j] * Ki[j][off + k]; dQref[i][off + k] += rha(acc, P); }
-        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dKref[j][off + k] += rha(Qi[i][off + k] * dSc[j], P);
+        for (int k = 0; k < dh; ++k) { int64_t acc = 0; for (int j = 0; j < L; ++j) acc += dSc[j] * Ki[j][off + k]; dQref[i][off + k] += rhu(acc, P); }
+        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dKref[j][off + k] += rhu(Qi[i][off + k] * dSc[j], P);
       }
     }
-    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) dWoref[a * d + b] = rha(dWoacc[a][b], 2 * P);
+    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) dWoref[a * d + b] = rhu(dWoacc[a][b], 2 * P);
     for (int i = 0; i < s; ++i) for (int k = 0; k < d; ++k) dHref[i][k] = dQref[i][k] + dKref[i][k] + dVref[i][k];
 
     // ============ FLOAT reference (true attention backward, sanity cross-check) ============

@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
     for (int v = 0; v < vocab; ++v) for (int k = 0; k < d; ++k) dWe_q[v * d + k] = FixedInfer::decode_signed(dLdWe[v * d + k].reveal());
 
     if (party == ALICE) {
-      auto rha = [&](int64_t N) -> int64_t { int64_t hf = 1LL << (P - 1), Dn = 1LL << P; return (N >= 0) ? (N + hf) / Dn : -(((-N) + hf) / Dn); };
+      auto rhu = [&](int64_t N) -> int64_t { return (N + (1LL << (P - 1))) >> P; };   // round-half-up: FixedInfer::requant_cm
       // float softmax over the (revealed) committed logits, for a sanity cross-check of p
       double lr[vocab], mx = -1e30, sum = 0, pf[vocab];
       for (int v = 0; v < vocab; ++v) { lr[v] = logits_q[v] / SCALE; if (lr[v] > mx) mx = lr[v]; }
@@ -104,10 +104,10 @@ int main(int argc, char **argv) {
 
       // EXACT: dL/dlogits = p - onehot*2^P
       for (int v = 0; v < vocab; ++v) { int64_t ref = p_q[v] - ((std::size_t)v == true_token ? (1LL << P) : 0); if (dl_q[v] != ref) { printf("[%d] dLdlogits[%d]: got %ld exp %ld MISMATCH\n", party, v, (long)dl_q[v], (long)ref); ok = false; } if (dbe_q[v] != dl_q[v]) { printf("[%d] dLdbe[%d] != dLdlogits\n", party, v); ok = false; } }
-      // EXACT: dH[k] = rha(sum_v We_q[v][k]*dl_q[v]) ; float cross-check
-      for (int k = 0; k < d; ++k) { int64_t acc = 0; for (int v = 0; v < vocab; ++v) acc += Weq[v][k] * dl_q[v]; int64_t ref = rha(acc); if (dH_q[k] != ref) { printf("[%d] dLdH[%d]: got %ld exp %ld MISMATCH\n", party, k, (long)dH_q[k], (long)ref); ok = false; } double fl = 0; for (int v = 0; v < vocab; ++v) fl += (Weq[v][k] / SCALE) * (dl_q[v] / SCALE); if (std::fabs(dH_q[k] / SCALE - fl) > 0.05) { printf("[%d] dLdH[%d] float diff %.4f\n", party, k, std::fabs(dH_q[k] / SCALE - fl)); ok = false; } }
-      // EXACT: dWe[v][k] = rha(dl_q[v]*H_q[k]) ; float cross-check
-      for (int v = 0; v < vocab; ++v) for (int k = 0; k < d; ++k) { int64_t ref = rha(dl_q[v] * Hq[k]); if (dWe_q[v * d + k] != ref) { printf("[%d] dLdWe[%d][%d]: got %ld exp %ld MISMATCH\n", party, v, k, (long)dWe_q[v * d + k], (long)ref); ok = false; } double fl = (dl_q[v] / SCALE) * (Hq[k] / SCALE); if (std::fabs(dWe_q[v * d + k] / SCALE - fl) > 0.05) { printf("[%d] dLdWe[%d][%d] float diff %.4f\n", party, v, k, std::fabs(dWe_q[v * d + k] / SCALE - fl)); ok = false; } }
+      // EXACT: dH[k] = rhu(sum_v We_q[v][k]*dl_q[v]) ; float cross-check
+      for (int k = 0; k < d; ++k) { int64_t acc = 0; for (int v = 0; v < vocab; ++v) acc += Weq[v][k] * dl_q[v]; int64_t ref = rhu(acc); if (dH_q[k] != ref) { printf("[%d] dLdH[%d]: got %ld exp %ld MISMATCH\n", party, k, (long)dH_q[k], (long)ref); ok = false; } double fl = 0; for (int v = 0; v < vocab; ++v) fl += (Weq[v][k] / SCALE) * (dl_q[v] / SCALE); if (std::fabs(dH_q[k] / SCALE - fl) > 0.05) { printf("[%d] dLdH[%d] float diff %.4f\n", party, k, std::fabs(dH_q[k] / SCALE - fl)); ok = false; } }
+      // EXACT: dWe[v][k] = rhu(dl_q[v]*H_q[k]) ; float cross-check
+      for (int v = 0; v < vocab; ++v) for (int k = 0; k < d; ++k) { int64_t ref = rhu(dl_q[v] * Hq[k]); if (dWe_q[v * d + k] != ref) { printf("[%d] dLdWe[%d][%d]: got %ld exp %ld MISMATCH\n", party, v, k, (long)dWe_q[v * d + k], (long)ref); ok = false; } double fl = (dl_q[v] / SCALE) * (Hq[k] / SCALE); if (std::fabs(dWe_q[v * d + k] / SCALE - fl) > 0.05) { printf("[%d] dLdWe[%d][%d] float diff %.4f\n", party, v, k, std::fabs(dWe_q[v * d + k] / SCALE - fl)); ok = false; } }
       printf("[%d] LM-head backward checked (softmax sanity + exact dLdlogits/dH/dWe/dbe + float)\n", party);
     }
 

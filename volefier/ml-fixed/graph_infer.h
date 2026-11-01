@@ -285,6 +285,8 @@ private:
     int64_t h = D / 2;
     return a >= 0 ? (a + h) / D : -(((-a) + h) / D);
   }
+  // FixedInfer::requant_cm's rounding (half up); D is a power of two
+  static int64_t rhu(int64_t a, int64_t D) { return (a + D / 2) >> __builtin_ctzll((uint64_t)D); }
   int64_t qz(double v) {
     return (int64_t)llround(v * (double)(1LL << P));
   }
@@ -346,7 +348,7 @@ private:
         if (hr) {
           int64_t a = 0;
           for (int d = 0; d < D; ++d) a += (*xr)[(int64_t)rr * D + d] * cr[(int64_t)v * D + d];
-          r[(int64_t)rr * V + v] = rdiv(a, 1LL << P);
+          r[(int64_t)rr * V + v] = rhu(a, 1LL << P);
         }
       }
     }
@@ -414,7 +416,7 @@ private:
             for (int k = 0; k < K; ++k)
               a += ar[((int64_t)g * M + m) * K + k] *
                    br[(Bb ? (int64_t)g * K * N : 0) + (int64_t)k * N + j];
-            r[((int64_t)g * M + m) * N + j] = rdiv(a, D);
+            r[((int64_t)g * M + m) * N + j] = rhu(a, D);
           }
       ref_[n.output[0]] = std::move(r);
     }
@@ -585,7 +587,7 @@ private:
       const auto &xr = ref_.at(n.input[0]);
       std::vector<int64_t> r(xr.size());
       const int64_t D = 1LL << P;
-      for (size_t i = 0; i < xr.size(); ++i) r[i] = rdiv(xr[i] * qm[nb == 1 ? 0 : i % nb], D);
+      for (size_t i = 0; i < xr.size(); ++i) r[i] = rhu(xr[i] * qm[nb == 1 ? 0 : i % nb], D);
       ref_[n.output[0]] = std::move(r);
     }
   }
@@ -610,7 +612,7 @@ private:
       const auto &xr = ref_.at(n.input[0]);
       std::vector<int64_t> r(xr.size());
       const int64_t D = 1LL << P;
-      for (size_t i = 0; i < xr.size(); ++i) r[i] = rdiv(xr[i] * qm[nb == 1 ? 0 : i % nb], D);
+      for (size_t i = 0; i < xr.size(); ++i) r[i] = rhu(xr[i] * qm[nb == 1 ? 0 : i % nb], D);
       ref_[n.output[0]] = std::move(r);
     }
   }
@@ -643,7 +645,7 @@ private:
         for (int o = 0; o < out; ++o) {
           int64_t a = 0;
           for (int i = 0; i < in; ++i) a += qW[o][i] * (*xr)[(int64_t)m * in + i];
-          r[(int64_t)m * out + o] = rdiv(a, D) + qb[o];
+          r[(int64_t)m * out + o] = rhu(a, D) + qb[o];
         }
       ref_[oname] = std::move(r);
     }
@@ -753,7 +755,7 @@ private:
                   if (ih >= 0 && ih < H && iw >= 0 && iw < Wd)
                     a += xr[(int64_t)ci * H * Wd + ih * Wd + iw] * qK[co][ci * K * K + ki * K + kj];
                 }
-            r[(int64_t)co * Pn + oh * Wo + ow] = rdiv(a, D) + qb[co];
+            r[(int64_t)co * Pn + oh * Wo + ow] = rhu(a, D) + qb[co];
           }
       ref_[n.output[0]] = std::move(r);
     }
@@ -793,7 +795,7 @@ private:
       const int64_t D = 1LL << P;
       for (int c = 0; c < C; ++c)
         for (int p = 0; p < HW; ++p)
-          r[(int64_t)c * HW + p] = rdiv(xr[(int64_t)c * HW + p] * qg[c], D) + qb[c];
+          r[(int64_t)c * HW + p] = rhu(xr[(int64_t)c * HW + p] * qg[c], D) + qb[c];
       ref_[n.output[0]] = std::move(r);
     }
   }

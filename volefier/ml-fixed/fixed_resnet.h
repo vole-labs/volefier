@@ -68,9 +68,8 @@ public:
     prg->random_data(&r, sizeof(r));
     return lo + (int64_t)(r % (uint64_t)(hi - lo + 1));
   }
-  static int64_t rcm(int64_t acc, int64_t c, int M) {
-    int64_t N = acc * c, h = (int64_t)1 << (M - 1), D = (int64_t)1 << M;
-    return N >= 0 ? (N + h) / D : -(((-N) + h) / D);
+  static int64_t rcm(int64_t acc, int64_t c, int M) {   // FixedInfer::requant_cm: round-half-up
+    return (acc * c + ((int64_t)1 << (M - 1))) >> M;
   }
   static int64_t rdiv(int64_t N, int64_t D) {
     return N >= 0 ? (N + D / 2) / D : -(((-N) + D / 2) / D);

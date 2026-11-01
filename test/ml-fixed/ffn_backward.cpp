@@ -3,7 +3,7 @@
 //                     ff = requant(W2 @ geluout)+b2.
 // Given upstream dL/dff and retained n2, hidden, geluout, produce dL/dn2 and the
 // parameter grads dL/dW1, dL/db1, dL/dW2, dL/db2.  All checked EXACTLY against a
-// fixed-point replay (same round-half-away requant + GELU' table) and against a
+// fixed-point replay (same round-half-up requant + GELU' table) and against a
 // float reference within tolerance.  Setup mirrors attention_backward.cpp.
 #include <iostream>
 #include <vector>
@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     // GELU' table (same as GELUBackward uses) for the exact replay
     vector<uint64_t> ggt = build_gelu_grad_table(GT, P, GOFF);
     auto gg = [&](int64_t xq) { return FixedInfer::decode_signed(ggt[(size_t)(xq + GOFF)]); };
-    auto rha = [&](int64_t N, int M) -> int64_t { int64_t half = 1LL << (M - 1), Dn = 1LL << M; return (N >= 0) ? (N + half) / Dn : -(((-N) + half) / Dn); };
+    auto rhu = [&](int64_t N, int M) -> int64_t { return (N + (1LL << (M - 1))) >> M; };   // round-half-up: FixedInfer::requant_cm
 
     // ===== EXACT fixed-point replay =====
     vector<vector<int64_t>> dN2ref(s, vector<int64_t>(d, 0)), dHid(s, vector<int64_t>(ffn, 0));
@@ -79,19 +79,19 @@ int main(int argc, char **argv) {
     for (int i = 0; i < s; ++i) {
       // W2 backward: dGelu[b] = sum_a W2[a][b]*dff[i][a]
       vector<int64_t> dGeluP(ffn);
-      for (int b = 0; b < ffn; ++b) { int64_t acc = 0; for (int a = 0; a < d; ++a) acc += W2i[a][b] * dffi[i][a]; dGeluP[b] = rha(acc, P); }
+      for (int b = 0; b < ffn; ++b) { int64_t acc = 0; for (int a = 0; a < d; ++a) acc += W2i[a][b] * dffi[i][a]; dGeluP[b] = rhu(acc, P); }
       for (int j = 0; j < d; ++j) db2ref[j] += dffi[i][j];
       for (int a = 0; a < d; ++a) for (int b = 0; b < ffn; ++b) dW2acc[a][b] += dffi[i][a] * gouti[i][b];
-      // GELU backward: dHidden[b] = rha(dGeluP[b] * GELU'(hidden[b]), P)
-      for (int b = 0; b < ffn; ++b) dHid[i][b] = rha(dGeluP[b] * gg(hidi[i][b]), P);
+      // GELU backward: dHidden[b] = rhu(dGeluP[b] * GELU'(hidden[b]), P)
+      for (int b = 0; b < ffn; ++b) dHid[i][b] = rhu(dGeluP[b] * gg(hidi[i][b]), P);
       for (int j = 0; j < ffn; ++j) db1ref[j] += dHid[i][j];
       // W1 backward: dN2[b] = sum_a W1[a][b]*dHidden[a]
-      for (int b = 0; b < d; ++b) { int64_t acc = 0; for (int a = 0; a < ffn; ++a) acc += W1i[a][b] * dHid[i][a]; dN2ref[i][b] = rha(acc, P); }
+      for (int b = 0; b < d; ++b) { int64_t acc = 0; for (int a = 0; a < ffn; ++a) acc += W1i[a][b] * dHid[i][a]; dN2ref[i][b] = rhu(acc, P); }
       for (int a = 0; a < ffn; ++a) for (int b = 0; b < d; ++b) dW1acc[a][b] += dHid[i][a] * n2i[i][b];
     }
     vector<int64_t> dW2ref(d * ffn), dW1ref(ffn * d);
-    for (int a = 0; a < d; ++a) for (int b = 0; b < ffn; ++b) dW2ref[a * ffn + b] = rha(dW2acc[a][b], P);
-    for (int a = 0; a < ffn; ++a) for (int b = 0; b < d; ++b) dW1ref[a * d + b] = rha(dW1acc[a][b], P);
+    for (int a = 0; a < d; ++a) for (int b = 0; b < ffn; ++b) dW2ref[a * ffn + b] = rhu(dW2acc[a][b], P);
+    for (int a = 0; a < ffn; ++a) for (int b = 0; b < d; ++b) dW1ref[a * d + b] = rhu(dW1acc[a][b], P);
 
     // ===== FLOAT reference (from committed ints; quantized GELU') =====
     double gN2[s][d] = {}, gW2[d][ffn] = {}, gW1[ffn][d] = {}, gb2[d] = {}, gb1[ffn] = {};

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <utility>
 #include <algorithm>
+#include <atomic>
 using namespace emp;
 
 // FixedInfer: building blocks for a VOLE-ZK proof of *fixed-point* neural-network
@@ -25,7 +26,7 @@ using namespace emp;
 // scale wc != 1 on the dense-layer rescale (quantization); here wc == 1.
 //
 // Proof model: VOLE-ZK (QuickSilver), interactive/designated-verifier, MSB-free
-// (all rescales via the two-sided range gadget). ALICE proves; BOB verifies.
+// (all rescales via the bounded one-sided requant). ALICE proves; BOB verifies.
 //
 // Proof model: this is VOLE-ZK (QuickSilver) — interactive, designated-verifier,
 // communication grows with #mults + #lookup-rows. ALICE is the prover (knows the
@@ -180,99 +181,92 @@ public:
     (recon + v.negate()).reveal_zero();
   }
 
-  // Bound on a requant OUTPUT q: |q| < 2^(q_bits-1).  The two-sided relation below pins q only
-  // modulo p (each in-range t1 admits its own huge field q), so q is committed as limbs of
+  // Bound on a requant OUTPUT q: |q| < 2^(q_bits-1).  The floor relation below pins q only modulo
+  // p (each in-range remainder admits its own huge field q), so q is committed as limbs of
   // q + 2^(q_bits-1) instead of as a free witness.  Callers with wider outputs pass a larger
   // bound per call.
   std::size_t q_bits = 36;
 
-  // Effective q bound for shift M: t1 lies in [0, 2^(M+1)], so (q, t1) is unique while
-  // 2^(qb+M+1) + 2^(M+1) < p, i.e. qb <= 59 - M.
+  // Effective q bound for shift M: N + 2^(M-1) = q*2^M + r is unique while 2^(qb+M) < p, i.e.
+  // qb + M <= 60.
   std::size_t out_qbits(std::size_t M, std::size_t qb) const {
-    if (M + 2 > 59) error("requant: shift too large for a bounded output\n");
-    return std::min(qb ? qb : q_bits, 59 - M);
+    if (M + 2 > 60) error("requant: shift too large for a bounded output\n");
+    return std::min(qb ? qb : q_bits, 60 - M);
   }
 
-  // zkGPT roundLayer: prove q = round(acc * c / 2^M) by the TWO-SIDED RANGE
-  // relation (no advice remainder, no MSB).  With N = acc*c:
-  //   t1 = 2^M + 2N - q*2^(M+1) >= 0,   t2 = 2^M - 2N + q*2^(M+1) >= 0,
-  // and t1 + t2 = 2^(M+1) (constant), so range-checking both into [0, 2^(M+1))
-  // forces q = round(N / 2^M) once q itself is bounded (see q_bits).  This is the c*2^e
-  // rescale: the rescale ratio S_in*S_w/S_out is searched to c*2^-M and applied here.
+  // q = round-half-up(acc * c / 2^M), the zkGPT c*2^e rescale.  ONE-SIDED (DeepProve-style): fold
+  // round-to-nearest into a +2^(M-1) bias and prove the floor by decomposing the DISCARDED low
+  // bits, N + 2^(M-1) = q*2^M + r with r in [0, 2^M) -- r and q are both rebuilt from bounded
+  // limbs, so (q, r) is the unique solution.
   IntFp requant_cm_one(IntFp acc, uint64_t c, std::size_t M, std::size_t qb = 0) const {
     std::vector<IntFp> out, in{acc};
     requant_cm_batch(out, in, c, M, qb);
     return out[0];
   }
 
-  // Batched round-half-away requant: ONE batch_feed for every limb (t1, t2 and the bounded q)
-  // + ONE batched zero-check.
+  // Batched requant: ONE batch_feed for every limb (remainder + bounded q) + ONE batched
+  // zero-check.  Limbs are precision bits; a top limb narrower than that is also looked up
+  // scaled by 2^(width deficit), so r covers exactly [0, 2^M) and q exactly [0, 2^QB)
+  // (DeepProve's shifted_chunk_multiplier).
   void requant_cm_batch(std::vector<IntFp> &out, const std::vector<IntFp> &acc, uint64_t c,
                         std::size_t M, std::size_t qb = 0) const {
     const std::size_t n = acc.size();
     out.resize(n);
     if (n == 0) return;
-    const std::size_t nchunks = (M + 1 + precision - 1) / precision;
+    if (M == 0) {  // identity (optional public scale)
+      for (std::size_t i = 0; i < n; ++i) out[i] = (c == 1) ? acc[i] : acc[i] * c;
+      return;
+    }
+    const std::size_t nr = (M + precision - 1) / precision;
     const std::size_t QB = out_qbits(M, qb), nq = (QB + precision - 1) / precision,
-                      nl = 2 * nchunks + nq; // limbs per element: t1, t2, then q + 2^(QB-1)
+                      nl = nr + nq; // limbs per element: remainder, then q + 2^(QB-1)
     const uint64_t qoff = static_cast<uint64_t>(1) << (QB - 1);
-    // top q limb also looked up scaled by 2^(nq*precision - QB): the limbs then cover exactly
-    // [0, 2^QB) (DeepProve's shifted_chunk_multiplier)
-    const uint64_t topmul = static_cast<uint64_t>(1) << (nq * precision - QB);
+    const uint64_t rtop = static_cast<uint64_t>(1) << (nr * precision - M);
+    const uint64_t qtop = static_cast<uint64_t>(1) << (nq * precision - QB);
     const uint64_t mask = (static_cast<uint64_t>(1) << precision) - 1;
-    const int64_t two_M = static_cast<int64_t>(1) << M;
-    const int64_t two_M1 = static_cast<int64_t>(1) << (M + 1);
+    const int64_t half = static_cast<int64_t>(1) << (M - 1);
     std::vector<IntFp> N(n);
     std::vector<uint64_t> raw(n * nl, 0);
-    // Phase 1: local -- N[i] and (ALICE) the raw limb values.
-    for (std::size_t i = 0; i < n; ++i) {
+    std::atomic<bool> overflow(false);
+    // Phase 1: local -- N[i] and (ALICE) the raw limb values.  Disjoint lanes -> threaded for
+    // large n only (requant is called many times on tiny per-head/per-row tensors).
+    const int rt = (n >= (std::size_t)1 << 16) ? mat_threads : 1;
+    volefier::parallel_for(n, rt, [&](std::size_t i) {
       N[i] = (c == 1) ? acc[i] : acc[i] * c;   // public scale: mul_const
       if (party == ALICE) {
-        int64_t Nv = decode_signed(static_cast<uint64_t>(VAL(N[i].value)));
-        int64_t half = static_cast<int64_t>(1) << (M - 1);
-        int64_t qv = (Nv >= 0) ? (Nv + half) / two_M : -(((-Nv) + half) / two_M);
-        if (qv < -static_cast<int64_t>(qoff) || qv >= static_cast<int64_t>(qoff))
-          error("requant: output exceeds q_bits -- pass a wider bound at this call site\n");
-        const int64_t t1v = two_M + 2 * Nv - qv * two_M1; // both in [0, 2^(M+1))
-        const int64_t t2v = two_M - 2 * Nv + qv * two_M1;
+        const int64_t Nb = decode_signed(static_cast<uint64_t>(VAL(N[i].value))) + half;
+        const int64_t qv = Nb >> static_cast<int>(M);   // arithmetic floor
+        const uint64_t rv = static_cast<uint64_t>(Nb - (qv << static_cast<int>(M)));
+        if (qv < -static_cast<int64_t>(qoff) || qv >= static_cast<int64_t>(qoff)) overflow = true;
         const uint64_t u = static_cast<uint64_t>(qv + static_cast<int64_t>(qoff));
         uint64_t *l = &raw[i * nl];
-        for (std::size_t k = 0; k < nchunks; ++k) {
-          l[k] = (static_cast<uint64_t>(t1v) >> (precision * k)) & mask;
-          l[nchunks + k] = (static_cast<uint64_t>(t2v) >> (precision * k)) & mask;
-        }
-        for (std::size_t k = 0; k < nq; ++k) l[2 * nchunks + k] = (u >> (precision * k)) & mask;
+        for (std::size_t k = 0; k < nr; ++k) l[k] = (rv >> (precision * k)) & mask;
+        for (std::size_t k = 0; k < nq; ++k) l[nr + k] = (u >> (precision * k)) & mask;
       }
-    }
+    });
+    if (overflow) error("requant: output exceeds q_bits -- pass a wider bound at this call site\n");
     // Phase 2: ONE batched commit of every limb.
     std::vector<IntFp> ch(n * nl);
     batch_feed(ch.data(), raw.data(), static_cast<int64_t>(n * nl));
-    // Phase 3: range-check limbs, rebuild q, t1, t2, ONE batched zero-check that recon == t.
-    const IntFp DM(static_cast<uint64_t>(1) << M, PUBLIC);
-    const IntFp negoff(PR - qoff, PUBLIC);
-    std::vector<IntFp> zchk;
-    zchk.reserve(2 * n);
-    for (std::size_t i = 0; i < n; ++i) {
-      IntFp *l = &ch[i * nl];
-      IntFp q = negoff;
-      for (std::size_t k = 0; k < nq; ++k)
-        q = q + l[2 * nchunks + k] * (static_cast<int64_t>(1) << (precision * k));
-      IntFp q2 = q * two_M1;
-      IntFp t1 = DM + N[i] * 2LL + q2.negate();
-      IntFp t2 = DM + (N[i] * 2LL).negate() + q2;
-      IntFp r1(static_cast<uint64_t>(0), PUBLIC), r2(static_cast<uint64_t>(0), PUBLIC);
-      for (std::size_t k = 0; k < nchunks; ++k) {
-        const int64_t w = static_cast<int64_t>(1) << (precision * k);
-        r1 = r1 + l[k] * w;
-        r2 = r2 + l[nchunks + k] * w;
-      }
-      for (std::size_t k = 0; k < nl; ++k) rc_rem->Access(l[k]);
-      if (topmul != 1) { IntFp t = l[nl - 1] * topmul; rc_rem->Access(t); }
-      zchk.push_back(r1 + t1.negate());
-      zchk.push_back(r2 + t2.negate());
+    // Phase 3: rebuild r and q, ONE batched zero-check of the floor.
+    const int64_t two_M = static_cast<int64_t>(1) << M;
+    const IntFp negoff(PR - qoff, PUBLIC), neghalf(PR - static_cast<uint64_t>(half), PUBLIC);
+    std::vector<IntFp> zchk(n);
+    volefier::parallel_for(n, rt, [&](std::size_t i) {
+      const IntFp *l = &ch[i * nl];
+      IntFp r(static_cast<uint64_t>(0), PUBLIC), q = negoff;
+      for (std::size_t k = 0; k < nr; ++k) r = r + l[k] * (static_cast<int64_t>(1) << (precision * k));
+      for (std::size_t k = 0; k < nq; ++k) q = q + l[nr + k] * (static_cast<int64_t>(1) << (precision * k));
+      zchk[i] = q * two_M + r + N[i].negate() + neghalf;   // N + 2^(M-1) == q*2^M + r
       out[i] = q;
+    });
+    for (std::size_t i = 0; i < n; ++i) {   // SERIAL: shared LogUp witness buffer
+      IntFp *l = &ch[i * nl];
+      for (std::size_t k = 0; k < nl; ++k) rc_rem->Access(l[k]);
+      if (rtop != 1) { IntFp t = l[nr - 1] * rtop; rc_rem->Access(t); }
+      if (qtop != 1) { IntFp t = l[nl - 1] * qtop; rc_rem->Access(t); }
     }
-    batch_reveal_check_zero(zchk.data(), static_cast<int64_t>(zchk.size()));
+    batch_reveal_check_zero(zchk.data(), static_cast<int64_t>(n));
   }
 
   void requant_cm(std::vector<IntFp> &out, const std::vector<IntFp> &acc, uint64_t c,
@@ -286,7 +280,7 @@ public:
   }
 
   // Fused multiplier + shift (e.g. attention's 1/sqrt(dh) folded into one
-  // requant): out = round(acc * fpm / 2^shift), still the two-sided form.
+  // requant): out = round(acc * fpm / 2^shift), same requant.
   IntFp requant_fp_shift(IntFp acc, uint64_t fpm, std::size_t shift) const {
     return requant_cm_one(acc, fpm, shift);
   }

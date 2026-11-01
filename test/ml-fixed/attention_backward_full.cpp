@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < s; ++i)
       for (int hh = 0; hh < h; ++hh) { pri[i][hh].resize(i + 1); for (int j = 0; j <= i; ++j) pri[i][hh][j] = q1(pr[i][hh][j]); }
 
-    auto rha = [&](int64_t N, int M) -> int64_t { int64_t half = 1LL << (M - 1), Dn = 1LL << M; return (N >= 0) ? (N + half) / Dn : -(((-N) + half) / Dn); };
+    auto rhu = [&](int64_t N, int M) -> int64_t { return (N + (1LL << (M - 1))) >> M; };   // round-half-up: FixedInfer::requant_cm
 
     // ===== EXACT replay: inner attention backward (identical to attention_backward.cpp) =====
     vector<vector<int64_t>> dQref(s, vector<int64_t>(d, 0)), dKref(s, vector<int64_t>(d, 0)), dVref(s, vector<int64_t>(d, 0));
@@ -92,17 +92,17 @@ int main(int argc, char **argv) {
         int off = hh * dh;
         vector<int64_t> dCtx_h(dh); for (int k = 0; k < dh; ++k) dCtx_h[k] = dCtxr[i][off + k];
         vector<int64_t> dprobsP(L);
-        for (int j = 0; j < L; ++j) { int64_t acc = 0; for (int k = 0; k < dh; ++k) acc += dCtx_h[k] * Vi[j][off + k]; dprobsP[j] = rha(acc, 2 * P); }
-        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dVref[j][off + k] += rha(pri[i][hh][j] * dCtx_h[k], 2 * P);
+        for (int j = 0; j < L; ++j) { int64_t acc = 0; for (int k = 0; k < dh; ++k) acc += dCtx_h[k] * Vi[j][off + k]; dprobsP[j] = rhu(acc, 2 * P); }
+        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dVref[j][off + k] += rhu(pri[i][hh][j] * dCtx_h[k], 2 * P);
         int64_t dot2p = 0; for (int j = 0; j < L; ++j) dot2p += pri[i][hh][j] * dprobsP[j];
-        int64_t dotP = rha(dot2p, P);
-        vector<int64_t> dScores(L); for (int j = 0; j < L; ++j) dScores[j] = rha(pri[i][hh][j] * (dprobsP[j] - dotP), P);
-        vector<int64_t> dSc(L); for (int j = 0; j < L; ++j) dSc[j] = rha(dScores[j] * (int64_t)qinv, P);
-        for (int k = 0; k < dh; ++k) { int64_t acc = 0; for (int j = 0; j < L; ++j) acc += dSc[j] * Ki[j][off + k]; dQref[i][off + k] += rha(acc, P); }
-        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dKref[j][off + k] += rha(Qi[i][off + k] * dSc[j], P);
+        int64_t dotP = rhu(dot2p, P);
+        vector<int64_t> dScores(L); for (int j = 0; j < L; ++j) dScores[j] = rhu(pri[i][hh][j] * (dprobsP[j] - dotP), P);
+        vector<int64_t> dSc(L); for (int j = 0; j < L; ++j) dSc[j] = rhu(dScores[j] * (int64_t)qinv, P);
+        for (int k = 0; k < dh; ++k) { int64_t acc = 0; for (int j = 0; j < L; ++j) acc += dSc[j] * Ki[j][off + k]; dQref[i][off + k] += rhu(acc, P); }
+        for (int j = 0; j < L; ++j) for (int k = 0; k < dh; ++k) dKref[j][off + k] += rhu(Qi[i][off + k] * dSc[j], P);
       }
     }
-    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) dWoref[a * d + b] = rha(dWoacc[a][b], 2 * P);
+    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) dWoref[a * d + b] = rhu(dWoacc[a][b], 2 * P);
 
     // ===== EXACT replay: projection backward (uses the inner dQref/dKref/dVref) =====
     // dWq_acc[a][b] += dQ[i][a]*Hn[i][b] (2^-2P);  dH[i][b] = sum_a Wq[a][b]*dQ[i][a] (2^-2P)
@@ -111,12 +111,12 @@ int main(int argc, char **argv) {
       for (int b = 0; b < d; ++b) {
         int64_t hq = 0, hk = 0, hv = 0;
         for (int a = 0; a < d; ++a) { hq += Wqi[a][b] * dQref[i][a]; hk += Wki[a][b] * dKref[i][a]; hv += Wvi[a][b] * dVref[i][a]; }
-        dHtrue[i][b] = rha(hq + hk + hv, P);
+        dHtrue[i][b] = rhu(hq + hk + hv, P);
       }
       for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) { dWqacc[a][b] += dQref[i][a] * Hni[i][b]; dWkacc[a][b] += dKref[i][a] * Hni[i][b]; dWvacc[a][b] += dVref[i][a] * Hni[i][b]; }
     }
     vector<int64_t> dWqref(d * d), dWkref(d * d), dWvref(d * d);
-    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) { dWqref[a * d + b] = rha(dWqacc[a][b], P); dWkref[a * d + b] = rha(dWkacc[a][b], P); dWvref[a * d + b] = rha(dWvacc[a][b], P); }
+    for (int a = 0; a < d; ++a) for (int b = 0; b < d; ++b) { dWqref[a * d + b] = rhu(dWqacc[a][b], P); dWkref[a * d + b] = rhu(dWkacc[a][b], P); dWvref[a * d + b] = rhu(dWvacc[a][b], P); }
 
     // ===== FLOAT reference =====
     double gQ[s][d] = {}, gK[s][d] = {}, gV[s][d] = {};

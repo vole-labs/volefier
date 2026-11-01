@@ -37,9 +37,8 @@ static vector<uint64_t> EXP_REF, GELU_REF;
 static int64_t fdiv(int64_t a, int64_t b) { int64_t q = a / b, r = a % b; if (r != 0 && ((r < 0) != (b < 0))) q--; return q; }
 static int64_t rdiv(int64_t N, int64_t D) { return (N >= 0) ? (N + D / 2) / D : -(((-N) + D / 2) / D); }
 static int64_t ars(int64_t x, int p) { return x >> p; }
-static int64_t rcm(int64_t acc, int64_t c, int M) {   // round(acc*c / 2^M), half away from 0
-  int64_t N = acc * c, h = (int64_t)1 << (M - 1), D = (int64_t)1 << M;
-  return (N >= 0) ? (N + h) / D : -(((-N) + h) / D);
+static int64_t rcm(int64_t acc, int64_t c, int M) {   // round(acc*c / 2^M), half up
+  return (acc * c + ((int64_t)1 << (M - 1))) >> M;
 }
 static uint64_t enc(int64_t v) { return v >= 0 ? (uint64_t)v : (uint64_t)(v + (int64_t)PR); }
 

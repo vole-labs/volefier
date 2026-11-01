@@ -50,14 +50,11 @@ int main(int argc, char **argv) {
 
     // Plaintext reference from the SAME gradient table + same round-half-away requant.
     vector<uint64_t> grad_tab = build_gelu_grad_table(GT, P, GOFF);
-    auto requant_rha = [&](int64_t Nv) -> int64_t { // matches FixedInfer::requant_cm_one
-      int64_t half = 1LL << (P - 1), D = 1LL << P;
-      return (Nv >= 0) ? (Nv + half) / D : -(((-Nv) + half) / D);
-    };
+    auto requant_rhu = [&](int64_t Nv) -> int64_t { return (Nv + (1LL << (P - 1))) >> P; }; // FixedInfer::requant_cm_one
     vector<int64_t> ref(N);
     for (int i = 0; i < N; ++i) {
       int64_t gp_q = FixedInfer::decode_signed(grad_tab[(std::size_t)(x_int[i] + GOFF)]);
-      ref[i] = requant_rha(dLdy_int[i] * gp_q);
+      ref[i] = requant_rhu(dLdy_int[i] * gp_q);
     }
 
     if (party == ALICE) {

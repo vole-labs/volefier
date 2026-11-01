@@ -2,7 +2,7 @@
 // SGD:  W_new = W_old - lr * dW.  lr is a public hyperparameter pre-quantized to
 // lr_q = round(lr * 2^P); lr_q*dW is at 2^-2P and requantized to 2^-P, then a free
 // subtraction gives W_new.  Committed W_old and dW; the revealed W_new is checked
-// EXACTLY against a fixed-point replay (same round-half-away requant) and cross-
+// EXACTLY against a fixed-point replay (same round-half-up requant) and cross-
 // checked against a float reference.  Also exercises the forward_mat() variant.
 // Setup mirrors test/ml-fixed/gelu_backward.cpp.
 #include <iostream>
@@ -49,15 +49,12 @@ int main(int argc, char **argv) {
     vector<int64_t> W_int(N), dW_int(N);
     for (int i = 0; i < N; ++i) { W_int[i] = llround(W_f[i] * SCALE); dW_int[i] = llround(dW_f[i] * SCALE); }
 
-    // round-half-away requant by 2^P (mirror FixedInfer::requant_cm)
-    auto rha = [&](int64_t Nn) -> int64_t {
-      int64_t h = 1LL << (P - 1), Dn = 1LL << P;
-      return (Nn >= 0) ? (Nn + h) / Dn : -(((-Nn) + h) / Dn);
-    };
+    // round-half-up requant by 2^P (mirror FixedInfer::requant_cm)
+    auto rhu = [&](int64_t Nn) -> int64_t { return (Nn + (1LL << (P - 1))) >> P; };
 
     // -------- reference: W_new_i = W_old_i - requant(lr_q * dW_i) --------
     vector<int64_t> ref(N);
-    for (int i = 0; i < N; ++i) ref[i] = W_int[i] - rha((int64_t)lr_q * dW_int[i]);
+    for (int i = 0; i < N; ++i) ref[i] = W_int[i] - rhu((int64_t)lr_q * dW_int[i]);
     // Float reference uses the EFFECTIVE quantized learning rate lr_q/2^P (what the
     // gadget actually applies), not the ideal lr: at P=7, lr=0.01 rounds to lr_q=1 =
     // 0.0078125, so comparing to the ideal 0.01 would measure lr-quantization error,

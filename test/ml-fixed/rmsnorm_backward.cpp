@@ -63,21 +63,18 @@ int main(int argc, char **argv) {
     int64_t dinv_int = llround(dinv_r * SCALE);
 
     // ---- Fixed-point reference replay (exact mirror of the gadget) ----
-    auto rha = [&](int64_t Nn) -> int64_t { // requant_cm round-half-away by 2^P
-      int64_t h = 1LL << (P - 1), Dn = 1LL << P;
-      return (Nn >= 0) ? (Nn + h) / Dn : -(((-Nn) + h) / Dn);
-    };
+    auto rhu = [&](int64_t Nn) -> int64_t { return (Nn + (1LL << (P - 1))) >> P; }; // requant_cm round-half-up by 2^P
     const int64_t Dbig = (int64_t)d << P; // d * 2^P, the mean divisor
     auto rdiv = [&](int64_t Nn) -> int64_t { // Div::round_div round-half-away by Dbig
       int64_t h = Dbig / 2;
       return (Nn >= 0) ? (Nn + h) / Dbig : -(((-Nn) + h) / Dbig);
     };
     vector<int64_t> dgamma_ref(N), g_ref(N), dx_ref(N);
-    for (int i = 0; i < N; ++i) dgamma_ref[i] = rha(dLdy_int[i] * xh_int[i]);
-    for (int i = 0; i < N; ++i) g_ref[i] = rha(gamma_int[i] * dLdy_int[i]);
+    for (int i = 0; i < N; ++i) dgamma_ref[i] = rhu(dLdy_int[i] * xh_int[i]);
+    for (int i = 0; i < N; ++i) g_ref[i] = rhu(gamma_int[i] * dLdy_int[i]);
     int64_t dot2p = 0; for (int j = 0; j < N; ++j) dot2p += g_ref[j] * xh_int[j];
     int64_t mean = rdiv(dot2p);
-    for (int i = 0; i < N; ++i) { int64_t Q = rha(xh_int[i] * mean); dx_ref[i] = rha(dinv_int * (g_ref[i] - Q)); }
+    for (int i = 0; i < N; ++i) { int64_t Q = rhu(xh_int[i] * mean); dx_ref[i] = rhu(dinv_int * (g_ref[i] - Q)); }
 
     // ---- Float reference (sanity cross-check within tolerance) ----
     double dotf = 0.0; for (int j = 0; j < N; ++j) dotf += gamma_f[j] * dLdy_f[j] * xhat_f[j];

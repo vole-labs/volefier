@@ -17,7 +17,7 @@ using namespace emp;
 // continuous VOLE-ZK proof.  Fixed-point convention is inherited from
 // FixedInfer: everything shares the global scale 2^-precision (real = q*2^-P),
 // so a product of two scale-2^-P tensors lands at 2^-2P and is rescaled back
-// with the same two-sided-range requant used in the forward pass -- no MSB.
+// with the same requant used in the forward pass -- no MSB.
 
 // ---------------------------------------------------------------------------
 // Softmax backward.  Given the softmax outputs p (probabilities at scale 2^-P,
@@ -129,7 +129,7 @@ static inline std::vector<uint64_t> build_gelu_grad_table(uint64_t T, int P, int
 // GELU'(x_i).  GELU'(x_i) is a public-function table lookup (idx = x_i + offset,
 // LogUp key-value binding range-checks it into [0, T)) mirroring the forward
 // FixedActivation; the chain-rule product is one committed multiply per element,
-// requantized from 2^-2P back to 2^-P with FixedInfer's two-sided-range requant.
+// requantized from 2^-2P back to 2^-P with FixedInfer's requant.
 // The class OWNS its gradient table -- call Teardown() before finalize_zk_arith.
 class GELUBackward {
 public:
@@ -180,7 +180,7 @@ public:
 // Distributed as the algebraically identical  dL/dx_i = dinv*(g_i - x_hat_i*mean),
 // g_i = gamma_i*dL/dy_i,  mean = dot/d -- so the only non-power-of-two division is
 // ONE mean (via Div::round_div by d*2^P), mirroring the forward RMSNorm's mean;
-// everything else is committed multiplies + the two-sided-range requant.  dinv, d
+// everything else is committed multiplies + the requant.  dinv, d
 // are the forward RMS witnesses; d is the feature dimension (== x_hat.size()).
 class RMSNormBackward {
 public:
@@ -231,7 +231,7 @@ public:
 // dL/dH, dL/dQ, dL/dK, dL/dV (all 2^-P) and dL/dWo (flat d*d, 2^-P).
 //
 // Everything is committed multiplies (via matmul_backward) + the softmax-Jacobian
-// gadget + two-sided-range requants; no new LogUp tables, so no Teardown().
+// gadget + requants; no new LogUp tables, so no Teardown().
 //
 // Scale bookkeeping (S = 2^P):
 //   * Output projection  out[i] = Wo @ ctx[i]  is proven per token with ONE

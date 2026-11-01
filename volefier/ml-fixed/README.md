@@ -44,7 +44,7 @@ WikiText-2 window exported by
 (tokens committed one-hot, embeddings proven as `onehot @ wte + wpe`, `ln_f` before the
 tied head). See [`test/ml-fixed/lora_train.h`](../../test/ml-fixed/lora_train.h). All of this
 reuses the same field machinery — the batched inner-product and Freivalds matmuls
-and the two-sided-range requant — adding no new proof primitive beyond the forward
+and the bounded requant — adding no new proof primitive beyond the forward
 pass except one lookup table for the GeLU derivative.
 
 The fixed-point number format used here (a Mersenne-prime field, a fixed

@@ -69,10 +69,9 @@ struct Gpt2Bin {
 static int env_i(const char *k, int def) { const char *v = getenv(k); return v ? atoi(v) : def; }
 static double env_d(const char *k, double def) { const char *v = getenv(k); return v ? atof(v) : def; }
 
-// round-half-away  N / 2^M, the rounding of FixedInfer::requant_cm
-static int64_t rha128(__int128 N, size_t M) {
-  const __int128 hf = (__int128)1 << (M - 1);
-  return (int64_t)(N >= 0 ? (N + hf) >> M : -((-N + hf) >> M));
+// round-half-up  N / 2^M, the rounding of FixedInfer::requant_cm
+static int64_t rhu128(__int128 N, size_t M) {
+  return (int64_t)((N + ((__int128)1 << (M - 1))) >> M);
 }
 
 static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
@@ -377,7 +376,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
             for (int i = 0; i < D; ++i) for (int j = 0; j < D; ++j) {
               __int128 acc = 0;
               for (int k = 0; k < R; ++k) acc += (__int128)Bp[(size_t)i * R + k] * Ap[(size_t)k * D + j];
-              if (dq(We_[i][j]) != W[(size_t)i * D + j] + rha128(acc * (__int128)lora.s_c, lora.s_M)) ++bad;
+              if (dq(We_[i][j]) != W[(size_t)i * D + j] + rhu128(acc * (__int128)lora.s_c, lora.s_M)) ++bad;
             }
           }
         printf("[1] step %d  W_eff = W + (alpha/r)BA exact replay: %zu mismatches\n", step, bad);
@@ -439,7 +438,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
           for (int k = 0; k < D; ++k) {
             __int128 acc = 0;
             for (int v = 0; v < V; ++v) acc += (__int128)dlq[t][v] * We[(size_t)v * D + k];
-            if (dq(dHl[t][k]) != rha128(acc, P)) ++bad_t[t];
+            if (dq(dHl[t][k]) != rhu128(acc, P)) ++bad_t[t];
           }
         });
         for (size_t x : bad_t) bad_dh += x;
@@ -489,14 +488,14 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
             for (int i = 0; i < D; ++i) for (int k = 0; k < R; ++k) {
               __int128 acc = 0; double fl = 0;
               for (int j = 0; j < D; ++j) { acc += (__int128)dW[(size_t)i * D + j] * Ap[(size_t)k * D + j]; fl += gW[(size_t)i * D + j] * Ap[(size_t)k * D + j] / MS; }
-              const int64_t u = rha128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)i * R + k;
+              const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)i * R + k;
               if (Bn[t] != Bp[t] - u) ++bad;
               uB[t] = u / MS; iB[t] = eta * lscale * fl; nzB += u != 0;
             }
             for (int k = 0; k < R; ++k) for (int j = 0; j < D; ++j) {
               __int128 acc = 0; double fl = 0;
               for (int i = 0; i < D; ++i) { acc += (__int128)Bp[(size_t)i * R + k] * dW[(size_t)i * D + j]; fl += Bp[(size_t)i * R + k] / MS * gW[(size_t)i * D + j]; }
-              const int64_t u = rha128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)k * D + j;
+              const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)k * D + j;
               if (An[t] != Ap[t] - u) ++bad;
               uA[t] = u / MS; iA[t] = eta * lscale * fl; nzA += u != 0;
             }

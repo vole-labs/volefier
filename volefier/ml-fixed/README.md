@@ -40,9 +40,9 @@ adapted projections; and several optimizer steps chain inside one proof. Each st
 runs a mini-batch (`BATCH` sequences, their gradients summed, one update on the mean
 loss) and updates the adapters by SGD or AdamW (`OPT=adamw`, `FixedAdamW`: committed
 first/second-moment state carried across steps, bias correction and decoupled weight
-decay, the square root and division proven with bounded relations, and a master copy of
-the adapters 16 bits finer so that the per-step decay and small updates are not rounded
-away). The training
+decay, the square root and division proven with bounded relations). Both optimizers update
+a master copy of the adapters 16 bits finer than the adapters themselves, so the per-step
+decay and small updates are not rounded away. The training
 forward (`forward_seq`) does every matmul over the whole sequence, as inference does.
 By default the model is random; `GPT2_BIN`/`TOKENS` load real GPT-2 small and a
 WikiText-2 window (`BATCH * SEQ + 1` tokens) exported by

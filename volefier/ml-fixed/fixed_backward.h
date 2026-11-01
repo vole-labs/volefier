@@ -650,31 +650,43 @@ public:
 
 // ---------------------------------------------------------------------------
 // LoRA adapter on one frozen projection W (dout x din):  W_eff = W + (alpha/r) * B @ A, with
-// B: dout x r and A: r x din, both flat row-major.  The adapters live at a FINER master scale
-// 2^-(P+E) (E extra fractional bits, like fp32 master weights in mixed precision) so a small SGD
-// step does not round to zero; W_eff is produced at the activation scale 2^-P.  Both directions
-// are proven from the COMMITTED adapters, so the forward pass is bound to them:
+// B: dout x r and A: r x din, both flat row-major.  The adapters live at a finer scale 2^-(P+E)
+// (E extra fractional bits); W_eff is produced at the activation scale 2^-P.  The SGD step
+// updates the optimizer's master copy of the adapters, X more bits finer (2^-(P+E+X), like fp32
+// master weights in mixed precision), so steps under one unit of 2^-(P+E) are not rounded away;
+// the adapters are the master copy rounded.  Both directions are proven from the COMMITTED
+// adapters, so the forward pass is bound to them:
 //   effective():  W_eff = W + round(B@A * s_c / 2^s_M)              (B@A at 2^-2(P+E))
-//   sgd_step():   B' = B - round((dW_eff @ A^T) * g_c / 2^g_M)
-//                 A' = A - round((B^T @ dW_eff) * g_c / 2^g_M)      (both at 2^-(2P+E+G))
-// with s_c/2^s_M = (alpha/r) * 2^-(P+2E) and g_c/2^g_M = eta * (alpha/r) * 2^-(P+G), eta the
+//   sgd_step():   Bm' = Bm - round((dW_eff @ A^T) * g_c / 2^g_M)     master copies, 2^-(P+E+X)
+//                 Am' = Am - round((B^T @ dW_eff) * g_c / 2^g_M)     (inputs at 2^-(2P+E+G))
+//                 B' = round(Bm' / 2^X),  A' = round(Am' / 2^X)
+// with s_c/2^s_M = (alpha/r) * 2^-(P+2E) and g_c/2^g_M = eta * (alpha/r) * 2^-(P+G-X), eta the
 // step's learning rate and dW_eff taken at the finer gradient scale 2^-(P+G) that
 // LoRABlockBackward produces.  (alpha/r) enters both directions exactly as in standard LoRA.
 class LoRAAdapter {
 public:
   FixedInfer *qi;
-  std::size_t dout, din, r, E, G;
+  std::size_t dout, din, r, E, G, X;
   uint64_t s_c, g_c;
   std::size_t s_M, g_M;
 
   LoRAAdapter(FixedInfer *qi_, std::size_t dout_, std::size_t din_, std::size_t r_,
-              std::size_t E_, std::size_t G_, double scale, double eta)
-      : qi(qi_), dout(dout_), din(din_), r(r_), E(E_), G(G_) {
+              std::size_t E_, std::size_t G_, double scale, double eta, std::size_t X_ = 16)
+      : qi(qi_), dout(dout_), din(din_), r(r_), E(E_), G(G_), X(X_) {
     const std::size_t P = qi->precision;
     to_fixed(scale, s_c, s_M);
     s_M += P + 2 * E;
     to_fixed(eta * scale, g_c, g_M);
     g_M += P + G;
+    if (g_M > X) g_M -= X;
+    else { g_c <<= X + 1 - g_M; g_M = 1; }
+  }
+
+  // The initial master copy of adapter values: exact, theta 2^X.
+  std::vector<IntFp> master(const std::vector<IntFp> &theta) const {
+    std::vector<IntFp> th(theta.size());
+    for (std::size_t i = 0; i < th.size(); ++i) th[i] = theta[i] * (static_cast<uint64_t>(1) << X);
+    return th;
   }
 
   // x ~= c / 2^M with c in [2^9, 2^10): 10 significant bits keeps acc*c far below 2^60.
@@ -703,17 +715,18 @@ public:
     mm_seq(qi, rawA, transpose_of(B, dout, r), dWeff, r, din, dout);
   }
 
-  // One SGD step on both adapters from dL/dW_eff (dout x din, 2^-(P+G)); both use the OLD B, A.
-  void sgd_step(std::vector<IntFp> &B_new, std::vector<IntFp> &A_new, const std::vector<IntFp> &B,
-                const std::vector<IntFp> &A, const std::vector<IntFp> &dWeff) const {
+  // One SGD step on both adapters from dL/dW_eff (dout x din, 2^-(P+G)); both gradients use the
+  // OLD B, A.  The master copies Bm, Am are updated in place, B and A set to them rounded.
+  void sgd_step(std::vector<IntFp> &B, std::vector<IntFp> &A, std::vector<IntFp> &Bm,
+                std::vector<IntFp> &Am, const std::vector<IntFp> &dWeff) const {
     std::vector<IntFp> rawB, rawA, uB, uA;
     raw_grads(rawB, rawA, B, A, dWeff);
     qi->requant_cm(uB, rawB, g_c, g_M);
     qi->requant_cm(uA, rawA, g_c, g_M);
-    B_new.resize(B.size());
-    A_new.resize(A.size());
-    for (std::size_t t = 0; t < B.size(); ++t) B_new[t] = B[t] + uB[t].negate();
-    for (std::size_t t = 0; t < A.size(); ++t) A_new[t] = A[t] + uA[t].negate();
+    for (std::size_t t = 0; t < Bm.size(); ++t) Bm[t] = Bm[t] + uB[t].negate();
+    for (std::size_t t = 0; t < Am.size(); ++t) Am[t] = Am[t] + uA[t].negate();
+    qi->requant_cm(B, Bm, 1, X);
+    qi->requant_cm(A, Am, 1, X);
   }
 };
 

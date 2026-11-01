@@ -33,7 +33,8 @@
 // 1e-8 / 0.01), ADAM_GRAD_BITS (fractional bits of the AdamW gradient, default 28: gradients
 // up to 2^(29-bits) in magnitude; gradients only a few units of 2^-bits get coarse AdamW updates,
 // so raise it when the gradients are small -- the random medium model needs ~36),
-// ADAM_MASTER_BITS (extra fractional bits of AdamW's master copy of the adapters, default 16),
+// OPT_MASTER_BITS (extra fractional bits of the optimizer's master copy of the adapters, SGD and
+// AdamW, default 16),
 // ALPHA (default 2*RANK), LSE (LogSumExp attention
 // softmax, default 1; 0 = the division softmax), HEAD_EXP_BITS (extra output bits of the head's
 // exp table, default 12), ATTN_EXP_BITS (extra output bits of the LSE attention softmax, default
@@ -118,7 +119,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
   const int DH = D / H;
   const double LR = env_d("LR", adamw ? 1e-3 : 1e-2), ALPHA = env_d("ALPHA", 2.0 * R);
   const double AB1 = env_d("ADAM_B1", 0.9), AB2 = env_d("ADAM_B2", 0.999), AEPS = env_d("ADAM_EPS", 1e-8), WD = env_d("WD", 0.01);
-  const size_t AFG = env_i("ADAM_GRAD_BITS", 28), AFX = env_i("ADAM_MASTER_BITS", 16);
+  const size_t AFG = env_i("ADAM_GRAD_BITS", 28), AFX = env_i("OPT_MASTER_BITS", 16);
   const bool CHECK = env_i("CHECK", 1) != 0;
   const char *peer_ip = getenv("PEER_IP") ? getenv("PEER_IP") : "127.0.0.1";
   BoolIO *ios[2] = {nullptr, nullptr};
@@ -168,7 +169,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     SoftmaxBackward sbk(&qi);
     LMHeadBackward lmb(&qi);
     const double lscale = ALPHA / R, eta = LR / ((double)NBATCH * T), gscale = lscale / ((double)NBATCH * T);
-    LoRAAdapter lora(&qi, D, D, R, E, G, lscale, eta); // Q and V adapters share the shape
+    LoRAAdapter lora(&qi, D, D, R, E, G, lscale, eta, AFX); // Q and V adapters share the shape
     // AdamW on the adapters (2^-(P+E); its master copy at 2^-(P+E+AFX)) from their raw gradients
     // at 2^-(2P+E+G)
     FixedAdamW *adam = adamw ? new FixedAdamW(&qi, &rclu, P + E, 2 * P + E + G, LR, AB1, AB2, AEPS, WD, AFG, AFX) : nullptr;
@@ -226,7 +227,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       B.g1.assign(D, q1(1.0)); B.g2.assign(D, q1(1.0)); B.b1n.assign(D, 0); B.b2n.assign(D, 0);
     }
     if (!real) { fill(We, (size_t)V * D, -0.02, 0.02); fill(be, V, -0.3, 0.3); }
-    const double MS = std::ldexp(1.0, (int)(P + E)); // adapter master scale
+    const double MS = std::ldexp(1.0, (int)(P + E)); // adapter scale
     const double abound = 1.0 / std::sqrt((double)D); // PEFT's kaiming_uniform(a=sqrt 5) bound
     vector<vector<int64_t>> A0q(NB), A0v(NB);
     for (int b = 0; b < NB; ++b) {
@@ -262,13 +263,16 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     const IntFp zero(0ULL, PUBLIC);
     vector<vector<IntFp>> Aq(NB), Av(NB), Bq(NB, vector<IntFp>((size_t)D * R, zero)), Bv(NB, vector<IntFp>((size_t)D * R, zero));
     for (int b = 0; b < NB; ++b) { Aq[b] = pubv(A0q[b]); Av[b] = pubv(A0v[b]); }
-    // adapter j of block b: 0 = B_q, 1 = A_q, 2 = B_v, 3 = A_v; AdamW moments start at 0, its
-    // master copies at the initial adapters
+    // adapter j of block b: 0 = B_q, 1 = A_q, 2 = B_v, 3 = A_v; the optimizer's master copies
+    // start at the initial adapters, the AdamW moments at 0
     auto prm = [&](int j, int b) -> vector<IntFp> & { return j == 0 ? Bq[b] : j == 1 ? Aq[b] : j == 2 ? Bv[b] : Av[b]; };
     vector<vector<IntFp>> am[4], av[4], amst[4];
-    for (int j = 0; j < 4 && adam; ++j) {
-      am[j].resize(NB); av[j].resize(NB); amst[j].resize(NB);
-      for (int b = 0; b < NB; ++b) { am[j][b].assign(prm(j, b).size(), zero); av[j][b].assign(prm(j, b).size(), zero); amst[j][b] = adam->master(prm(j, b)); }
+    for (int j = 0; j < 4; ++j) {
+      amst[j].resize(NB);
+      for (int b = 0; b < NB; ++b) amst[j][b] = adam ? adam->master(prm(j, b)) : lora.master(prm(j, b));
+      if (!adam) continue;
+      am[j].resize(NB); av[j].resize(NB);
+      for (int b = 0; b < NB; ++b) { am[j][b].assign(prm(j, b).size(), zero); av[j][b].assign(prm(j, b).size(), zero); }
     }
     vector<Mat> cx(NBATCH, Mat(S)), onehot(NBATCH, Mat(T, vector<IntFp>(V)));
     auto commit_onehot = [&](vector<IntFp> &row, int id) {
@@ -529,21 +533,26 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
 
       // ================= ADAPTER UPDATE (one per step, on the batch-mean loss) =================
       auto to = chrono::steady_clock::now();
-      size_t nzB = 0, nzA = 0, nB = 0, nA = 0, nxB = 0, nxA = 0; // nx: AdamW master entries changed
+      size_t nzB = 0, nzA = 0, nB = 0, nA = 0, nxB = 0, nxA = 0; // nx: master-copy entries changed
       double hr = 0; // largest |requant input| of the gradient rescale, log2 (must stay < 59)
       double gtop = 0; // largest |AdamW gradient|
       size_t glow = 0, gnz = 0; // nonzero AdamW gradients, and those under 32 units (coarse there)
       for (int b = 0; b < NB; ++b) {
         if (!adam) {
-          vector<IntFp> Bq2, Aq2, Bv2, Av2;
-          lora.sgd_step(Bq2, Aq2, Bq[b], Aq[b], dWqs[b]);
-          lora.sgd_step(Bv2, Av2, Bv[b], Av[b], dWvs[b]);
+          vector<int64_t> old[4], oldm[4];   // pre-step adapters and master copies
+          if (CHECK && party == ALICE) for (int j = 0; j < 4; ++j) { old[j] = dqv(prm(j, b)); oldm[j] = dqv(amst[j][b]); }
+          lora.sgd_step(Bq[b], Aq[b], amst[0][b], amst[1][b], dWqs[b]);
+          lora.sgd_step(Bv[b], Av[b], amst[2][b], amst[3][b], dWvs[b]);
           if (CHECK && party == ALICE) {
             auto tc = chrono::steady_clock::now();
-            // adapter step: exact replay + effect
+            // adapter step: exact replay (master copy, then the rounded adapters) + effect
+            const double XS = std::ldexp(1.0, (int)(P + E + lora.X));
+            auto rnd = [&](int64_t x) { return lora.X ? rhu128((__int128)x, lora.X) : x; };
             for (int which = 0; which < 2; ++which) {
-              const vector<int64_t> Bp = dqv(which ? Bv[b] : Bq[b]), Ap = dqv(which ? Av[b] : Aq[b]);
-              const vector<int64_t> dW = dqv(which ? dWvs[b] : dWqs[b]), Bn = dqv(which ? Bv2 : Bq2), An = dqv(which ? Av2 : Aq2);
+              const int jb = 2 * which, ja = jb + 1;
+              const vector<int64_t> &Bp = old[jb], &Ap = old[ja], &Bmp = oldm[jb], &Amp = oldm[ja];
+              const vector<int64_t> dW = dqv(which ? dWvs[b] : dWqs[b]), Bn = dqv(prm(jb, b)), An = dqv(prm(ja, b));
+              const vector<int64_t> Bmn = dqv(amst[jb][b]), Amn = dqv(amst[ja][b]);
               const vector<double> &gW = which ? gWvs[b] : gWqs[b];
               size_t bad = 0;
               vector<double> uB((size_t)D * R), iB((size_t)D * R, 0.0), uA((size_t)R * D), iA((size_t)R * D, 0.0);
@@ -552,16 +561,16 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
                 for (int j = 0; j < D; ++j) { acc += (__int128)dW[(size_t)i * D + j] * Ap[(size_t)kk * D + j]; fl += gW[(size_t)i * D + j] * Ap[(size_t)kk * D + j] / MS; }
                 hr = max(hr, log2(fabs((double)acc) * lora.g_c + 1));
                 const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)i * R + kk;
-                if (Bn[t] != Bp[t] - u) ++bad;
-                uB[t] = u / MS; iB[t] = eta * lscale * fl; nzB += u != 0;
+                if (Bmn[t] != Bmp[t] - u || Bn[t] != rnd(Bmn[t])) ++bad;
+                uB[t] = u / XS; iB[t] = eta * lscale * fl; nzB += Bn[t] != Bp[t]; nxB += u != 0;
               }
               for (int kk = 0; kk < R; ++kk) for (int j = 0; j < D; ++j) {
                 __int128 acc = 0; double fl = 0;
                 for (int i = 0; i < D; ++i) { acc += (__int128)Bp[(size_t)i * R + kk] * dW[(size_t)i * D + j]; fl += Bp[(size_t)i * R + kk] / MS * gW[(size_t)i * D + j]; }
                 hr = max(hr, log2(fabs((double)acc) * lora.g_c + 1));
                 const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)kk * D + j;
-                if (An[t] != Ap[t] - u) ++bad;
-                uA[t] = u / MS; iA[t] = eta * lscale * fl; nzA += u != 0;
+                if (Amn[t] != Amp[t] - u || An[t] != rnd(Amn[t])) ++bad;
+                uA[t] = u / XS; iA[t] = eta * lscale * fl; nzA += An[t] != Ap[t]; nxA += u != 0;
               }
               nB += uB.size(); nA += uA.size();
               printf("[1]   blk%-2d adapter %c: SGD exact replay %zu mismatches | cos(update, float update) B %.4f  A %.4f\n",
@@ -570,7 +579,6 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
             }
             chk_s += secs(tc);
           }
-          Bq[b] = Bq2; Aq[b] = Aq2; Bv[b] = Bv2; Av[b] = Av2;
         } else {
           vector<IntFp> raw[4];
           lora.raw_grads(raw[0], raw[1], Bq[b], Aq[b], dWqs[b]);
@@ -640,10 +648,9 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       }
       const double t_opt = secs(to);
       if (CHECK && party == ALICE)
-        printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%) | gradient rescale input up to 2^%.1f (limit 2^59)%s\n",
-               step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA, hr,
-               adam ? (" | master copy changed: B " + to_string(nB ? 100.0 * nxB / nB : 0.0) + "%  A " + to_string(nA ? 100.0 * nxA / nA : 0.0) +
-                       "% | max |g| " + to_string(gtop) + ", " + to_string(gnz ? 100.0 * glow / gnz : 0.0) +
+        printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%) | master copy changed: B %.1f%%  A %.1f%% | gradient rescale input up to 2^%.1f (limit 2^59)%s\n",
+               step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA, 100.0 * nxB / nB, 100.0 * nxA / nA, hr,
+               adam ? (" | max |g| " + to_string(gtop) + ", " + to_string(gnz ? 100.0 * glow / gnz : 0.0) +
                        "% of gradients under 32 units (raise ADAM_GRAD_BITS if large)").c_str() : "");
       printf("[%d] step %d done: W_eff+forward %.1fs, head %.1fs, backward %.1fs, %s %.1fs (wall incl. prover checks)\n",
              party, step, t_fwd, t_head, t_bwd, adam ? "AdamW" : "SGD", t_opt);

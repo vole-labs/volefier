@@ -289,14 +289,27 @@ public:
             IntFp *DW = INVBATCH ? denom_own.data() : denom_w.data();
             { LogUpSpan _sp(LP_AINV, io);
             if (party == ALICE) {
-                if (flat)
-                    for (std::size_t i = 0; i < b; ++i) {
-                        uint64_t wv = static_cast<uint64_t>(VAL(witnesses[off + i].value));
-                        ivw[i] = (wv < inv_flat.size() && inv_flat[wv])
-                                     ? inv_flat[wv]
-                                     : mod_inv(mod(x_val + wv));   // miss = dishonest witness; identity fails anyway
+                if (flat) {
+                    // threaded: random loads from a table of up to 2^24 entries are latency-bound
+                    auto inv_work = [&](std::size_t lo, std::size_t hi) {
+                        for (std::size_t i = lo; i < hi; ++i) {
+                            uint64_t wv = static_cast<uint64_t>(VAL(witnesses[off + i].value));
+                            ivw[i] = (wv < inv_flat.size() && inv_flat[wv])
+                                         ? inv_flat[wv]
+                                         : mod_inv(mod(x_val + wv));   // miss = dishonest witness; identity fails anyway
+                        }
+                    };
+                    if (NT <= 1 || b < (std::size_t)(1 << 16)) {
+                        inv_work(0, b);
+                    } else {
+                        const std::size_t per = b / (std::size_t)NT;
+                        std::vector<std::future<void>> fut;
+                        for (int t = 0; t < NT - 1; ++t)
+                            fut.push_back(ostr->pool_->enqueue([&, t, per]() { inv_work((std::size_t)t * per, (std::size_t)(t + 1) * per); }));
+                        inv_work((std::size_t)(NT - 1) * per, b);
+                        for (auto &f : fut) f.get();
                     }
-                else
+                } else
                     for (std::size_t i = 0; i < b; ++i) {
                         uint64_t wv = static_cast<uint64_t>(VAL(witnesses[off + i].value));
                         auto it = inv_cache.find(wv);

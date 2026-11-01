@@ -200,8 +200,10 @@ public:
   // Bound on a requant OUTPUT q: |q| < 2^(q_bits-1).  The floor relation Nb = q*2^Mpad + r
   // with r in [0,2^Mpad) pins q only modulo p -- each in-range r admits its own (huge) field q --
   // so q is committed as limbs of q + 2^(q_bits-1) instead of as a free witness (DeepProve's
-  // value + zeroing chunks).  Callers with wider outputs pass a larger bound per call.
-  std::size_t q_bits = 36;
+  // value + zeroing chunks).  Callers with wider outputs pass a larger bound per call.  24 bits
+  // (two 12-bit limbs) covers the int12 activations and logits; honest GPT-2 / BERT outputs peak
+  // near 20 bits.
+  std::size_t q_bits = 24;
 
   // Effective q bound for shift Mpad: sound while 2^(qb+Mpad) < p, i.e. qb + Mpad <= 60.
   std::size_t out_qbits(std::size_t Mpad, std::size_t qb) const {

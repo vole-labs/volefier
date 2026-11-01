@@ -28,18 +28,22 @@ decomposition and no floating-point circuits.
 Beyond inference, this track also proves a **training step** — a
 proof-of-fine-tuning. Backward-pass gadgets consume the committed forward-pass
 activations and produce committed gradients (softmax, GeLU, LayerNorm and RMSNorm
-backward; attention, feed-forward and LM-head backward; and an SGD weight
-update), so a full forward-and-backward step is one continuous proof. It supports
+backward; attention, feed-forward and LM-head backward; and SGD or AdamW weight
+updates), so a full forward-and-backward step is one continuous proof. It supports
 **LoRA fine-tuning** in particular (`LoRAAdapter`, `LoRABlockBackward`): the
 effective weight `W + (alpha/r)·B·A` is proven from the committed adapters, so the
 forward pass is bound to them; the base model and the LoRA init are public, so the
 statement names the model being tuned; labels are private (committed one-hot); the
 adapters keep extra fractional bits so small steps do not round away; the backward
 for frozen weights works on the whole sequence and produces gradients only for the
-adapted projections; and several SGD steps chain inside one proof. The training
+adapted projections; and several optimizer steps chain inside one proof. Each step
+runs a mini-batch (`BATCH` sequences, their gradients summed, one update on the mean
+loss) and updates the adapters by SGD or AdamW (`OPT=adamw`, `FixedAdamW`: committed
+first/second-moment state carried across steps, bias correction and decoupled weight
+decay, the square root and division proven with bounded relations). The training
 forward (`forward_seq`) does every matmul over the whole sequence, as inference does.
 By default the model is random; `GPT2_BIN`/`TOKENS` load real GPT-2 small and a
-WikiText-2 window exported by
+WikiText-2 window (`BATCH * SEQ + 1` tokens) exported by
 [`tools/quantize_export/export_gpt2_lora.py`](../../tools/quantize_export/export_gpt2_lora.py)
 (tokens committed one-hot, embeddings proven as `onehot @ wte + wpe`, `ln_f` before the
 tied head). See [`test/ml-fixed/lora_train.h`](../../test/ml-fixed/lora_train.h). All of this

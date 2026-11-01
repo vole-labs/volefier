@@ -1,28 +1,37 @@
 // LoRA fine-tuning proof for the ml-fixed track, shared by lora_train_step (one toy block) and
-// multiblock_lora_train_step (GPT-2-small shape).  STEPS SGD steps run in ONE ZK session:
+// multiblock_lora_train_step (GPT-2-small shape).  STEPS optimizer steps over a mini-batch of
+// BATCH sequences run in ONE ZK session:
 //   public:   the base model (every frozen weight incl. the LM head), the LoRA init
 //             (A Kaiming-uniform, B = 0) and the hyperparameters -- the statement names the model
 //   private:  the training tokens / input embeddings, the next-token labels (committed one-hot),
 //             every activation, gradient and adapter value after the init
 //   per step: W_eff = W + (alpha/r) B@A for Q and V of every block, proven from the committed
-//             adapters -> proven forward chain (whole-sequence matmuls, forward_seq) -> softmax
-//             cross-entropy over the last LOSS_TOKENS positions -> batched frozen-weight backward
-//             (LoRABlockBackward) -> SGD on the adapters only, eta = LR / LOSS_TOKENS (mean loss).
-//             The updated adapters feed the next step's W_eff.
+//             adapters; then for each sequence of the batch: proven forward chain (whole-sequence
+//             matmuls, forward_seq) -> softmax cross-entropy over the last LOSS_TOKENS positions ->
+//             batched frozen-weight backward (LoRABlockBackward), its dL/dW_eff added into the
+//             batch sum; then one update of the adapters only on the mean loss over the
+//             BATCH * LOSS_TOKENS positions: SGD (eta = LR / (BATCH * LOSS_TOKENS)) or AdamW
+//             (FixedAdamW, committed moment state).  The updated adapters feed the next step's
+//             W_eff.  Every step trains on the same BATCH sequences.
 // Model: random weights of the given shape by default.  GPT2_BIN=<gpt2_lora.bin> TOKENS=<ids>
-// (tools/quantize_export/export_gpt2_lora.py) loads real GPT-2 and SEQ+1 real tokens instead: the
-// tokens are committed one-hot, the input embeddings are proven as onehot @ wte + wpe, the labels
-// are the same one-hot rows shifted by one, and the final LayerNorm ln_f runs before the tied head.
+// (tools/quantize_export/export_gpt2_lora.py, its seq argument = BATCH * SEQ) loads real GPT-2 and
+// BATCH * SEQ + 1 real tokens instead; sequence k is tokens k*SEQ .. k*SEQ+SEQ.  The tokens are
+// committed one-hot, the input embeddings are proven as onehot @ wte + wpe, the labels are the
+// same one-hot rows shifted by one, and the final LayerNorm ln_f runs before the tied head.
 // Nothing is revealed to the verifier.  With CHECK=1 (default) the PROVER checks its own witness
 // values (read locally from the commitments, never revealed) against plaintext replays: exact for
-// W_eff, dL/dlogits, the head's dL/dH and the adapter updates; float tolerance for each block's
-// backward, driven by that block's own forward intermediates and upstream gradient.  It also
-// reports how many adapter entries each step changed and the cosine between the proven update and
-// the float-reference update.
+// W_eff, dL/dlogits, the head's dL/dH and the adapter updates (incl. the AdamW moments); float
+// tolerance for each block's backward, driven by that block's own forward intermediates and
+// upstream gradient.  It also reports how many adapter entries each step changed and the cosine
+// between the proven update and the float-reference update (float SGD / float AdamW from the
+// float gradients).
 //
-// Shape / run knobs (env): NB SEQ D HEADS FFN VOCAB RANK STEPS LOSS_TOKENS, P (default 12),
-// MASTER_BITS (adapter extra precision, default 8), GRAD_BITS (extra precision of dL/dW_eff,
-// default 8, must be < P), LR (default 1e-2), ALPHA (default 2*RANK), LSE (LogSumExp attention
+// Shape / run knobs (env): NB SEQ D HEADS FFN VOCAB RANK STEPS LOSS_TOKENS, BATCH (default 1),
+// OPT (sgd | adamw, default sgd), P (default 12), MASTER_BITS (adapter extra precision,
+// default 8), GRAD_BITS (extra precision of dL/dW_eff, default 8, must be < P), LR (default 1e-2
+// for SGD, 1e-3 for AdamW), ADAM_B1 / ADAM_B2 / ADAM_EPS / WD (AdamW, default 0.9 / 0.999 /
+// 1e-8 / 0.01), ADAM_GRAD_BITS (fractional bits of the AdamW gradient, default 28: gradients
+// up to 2^(29-bits) in magnitude), ALPHA (default 2*RANK), LSE (LogSumExp attention
 // softmax, default 1; 0 = the division softmax), HEAD_EXP_BITS (extra output bits of the head's
 // exp table, default 12), ATTN_EXP_BITS (extra output bits of the LSE attention softmax, default
 // 8), GPT2_BIN, TOKENS, CHECK, ZK_THREADS, PEER_IP.
@@ -88,20 +97,25 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
   const int NB = env_i("NB", real ? gbin.NB : c.NB), S = env_i("SEQ", c.S);
   const int D = real ? gbin.D : env_i("D", c.D), H = real ? gbin.H : env_i("HEADS", c.H);
   const int FFN = real ? gbin.FFN : env_i("FFN", c.FFN), V = real ? gbin.V : env_i("VOCAB", c.V), R = env_i("RANK", c.R);
-  const int STEPS = env_i("STEPS", c.STEPS), T = env_i("LOSS_TOKENS", S);
+  const int STEPS = env_i("STEPS", c.STEPS), T = env_i("LOSS_TOKENS", S), NBATCH = env_i("BATCH", 1);
+  const char *opt_s = getenv("OPT");
+  const bool adamw = opt_s && !strcmp(opt_s, "adamw");
+  if (opt_s && !adamw && strcmp(opt_s, "sgd")) { fprintf(stderr, "OPT must be sgd or adamw\n"); return 1; }
   const bool lse = env_i("LSE", 1) != 0;
   const int HX = env_i("HEAD_EXP_BITS", 12);
   const int AX = lse ? env_i("ATTN_EXP_BITS", 8) : 0; // extra output bits of the LSE attention softmax
-  vector<int> ids; // real mode: SEQ+1 token ids; position t predicts ids[t+1]
+  vector<int> ids; // real mode: BATCH*SEQ+1 token ids; sequence k, position t predicts ids[k*SEQ+t+1]
   if (real) {
     const char *tp = getenv("TOKENS");
     FILE *tf = tp ? fopen(tp, "r") : nullptr;
-    for (int v; tf && (int)ids.size() < S + 1 && fscanf(tf, "%d", &v) == 1;) ids.push_back(v);
+    for (int v; tf && (int)ids.size() < NBATCH * S + 1 && fscanf(tf, "%d", &v) == 1;) ids.push_back(v);
     if (tf) fclose(tf);
-    if ((int)ids.size() < S + 1 || NB > gbin.NB || S > gbin.NPOS) { fprintf(stderr, "need TOKENS with SEQ+1 ids, NB <= %d, SEQ <= %d\n", gbin.NB, gbin.NPOS); return 1; }
+    if ((int)ids.size() < NBATCH * S + 1 || NB > gbin.NB || S > gbin.NPOS) { fprintf(stderr, "need TOKENS with BATCH*SEQ+1 ids, NB <= %d, SEQ <= %d\n", gbin.NB, gbin.NPOS); return 1; }
   }
   const int DH = D / H;
-  const double LR = env_d("LR", 1e-2), ALPHA = env_d("ALPHA", 2.0 * R);
+  const double LR = env_d("LR", adamw ? 1e-3 : 1e-2), ALPHA = env_d("ALPHA", 2.0 * R);
+  const double AB1 = env_d("ADAM_B1", 0.9), AB2 = env_d("ADAM_B2", 0.999), AEPS = env_d("ADAM_EPS", 1e-8), WD = env_d("WD", 0.01);
+  const size_t AFG = env_i("ADAM_GRAD_BITS", 28);
   const bool CHECK = env_i("CHECK", 1) != 0;
   const char *peer_ip = getenv("PEER_IP") ? getenv("PEER_IP") : "127.0.0.1";
   BoolIO *ios[2] = {nullptr, nullptr};
@@ -110,8 +124,8 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
   const int64_t _ev = getenv("EXP_VOLE") ? atoll(getenv("EXP_VOLE")) : 0LL;
   const int _vt = getenv("VOLE_THREADS") ? atoi(getenv("VOLE_THREADS")) : -1;
   if (party == ALICE)
-    printf("[cfg] %s: model=%s NB=%d SEQ=%d D=%d HEADS=%d FFN=%d VOCAB=%d RANK=%d STEPS=%d LOSS_TOKENS=%d P=%d MASTER_BITS=%zu GRAD_BITS=%zu LR=%g ALPHA=%g LSE=%d threads=%d CHECK=%d\n",
-           name, real ? bin_path : "random", NB, S, D, H, FFN, V, R, STEPS, T, P, E, G, LR, ALPHA, (int)lse, threads, (int)CHECK);
+    printf("[cfg] %s: model=%s NB=%d SEQ=%d D=%d HEADS=%d FFN=%d VOCAB=%d RANK=%d STEPS=%d BATCH=%d LOSS_TOKENS=%d P=%d MASTER_BITS=%zu GRAD_BITS=%zu OPT=%s LR=%g ALPHA=%g LSE=%d threads=%d CHECK=%d\n",
+           name, real ? bin_path : "random", NB, S, D, H, FFN, V, R, STEPS, NBATCH, T, P, E, G, adamw ? "adamw" : "sgd", LR, ALPHA, (int)lse, threads, (int)CHECK);
   setup_zk_arith(ios, threads, party, _ev, ios[1], _vt);
   auto t0 = chrono::steady_clock::now();
   auto secs = [](chrono::steady_clock::time_point a) { return chrono::duration<double>(chrono::steady_clock::now() - a).count(); };
@@ -150,8 +164,13 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     LayerNormBackward lnb(&qi, &divr_ln);
     SoftmaxBackward sbk(&qi);
     LMHeadBackward lmb(&qi);
-    const double lscale = ALPHA / R, eta = LR / T;
+    const double lscale = ALPHA / R, eta = LR / ((double)NBATCH * T), gscale = lscale / ((double)NBATCH * T);
     LoRAAdapter lora(&qi, D, D, R, E, G, lscale, eta); // Q and V adapters share the shape
+    // AdamW on the adapters (master scale 2^-(P+E)) from their raw gradients at 2^-(2P+E+G)
+    FixedAdamW *adam = adamw ? new FixedAdamW(&qi, &rclu, P + E, 2 * P + E + G, LR, AB1, AB2, AEPS, WD, AFG) : nullptr;
+    if (adam && party == ALICE)
+      printf("[cfg] AdamW: b1 %g b2 %g eps %g wd %g | g at 2^-%zu (|g| < 2^%d), v_hat at 2^-%zu, sqrt(v_hat) at 2^-%zu, eps = %llu at that scale\n",
+             AB1, AB2, AEPS, WD, adam->Fg, 29 - (int)adam->Fg, adam->Fv, adam->Fv / 2 + adam->K, (unsigned long long)adam->e);
     vector<FixedLayerNorm *> ln1(NB), ln2(NB);
     vector<FixedAttention *> attn(NB);
     vector<FixedTransformerBlock *> tblk(NB);
@@ -211,12 +230,14 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       for (auto &e : A0q[b]) e = llround(ur(-abound, abound) * MS);
       for (auto &e : A0v[b]) e = llround(ur(-abound, abound) * MS);
     }
-    vector<int64_t> xq;
-    vector<int> label(T);
-    if (real) for (int t = 0; t < T; ++t) label[t] = ids[S - T + 1 + t];
-    else {
-      fill(xq, (size_t)S * D, -1, 1);
-      for (auto &l : label) l = (int)(nx() % (uint64_t)V);
+    vector<vector<int64_t>> xq(NBATCH);
+    vector<vector<int>> label(NBATCH, vector<int>(T));
+    for (int k = 0; k < NBATCH; ++k) {
+      if (real) for (int t = 0; t < T; ++t) label[k][t] = ids[(size_t)k * S + S - T + 1 + t];
+      else {
+        fill(xq[k], (size_t)S * D, -1, 1);
+        for (auto &l : label[k]) l = (int)(nx() % (uint64_t)V);
+      }
     }
 
     // ---- public constants + private commitments ----
@@ -237,18 +258,22 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     const IntFp zero(0ULL, PUBLIC);
     vector<vector<IntFp>> Aq(NB), Av(NB), Bq(NB, vector<IntFp>((size_t)D * R, zero)), Bv(NB, vector<IntFp>((size_t)D * R, zero));
     for (int b = 0; b < NB; ++b) { Aq[b] = pubv(A0q[b]); Av[b] = pubv(A0v[b]); }
-    Mat cx(S), onehot(T, vector<IntFp>(V));
+    // adapter j of block b: 0 = B_q, 1 = A_q, 2 = B_v, 3 = A_v; AdamW moments start at 0
+    auto prm = [&](int j, int b) -> vector<IntFp> & { return j == 0 ? Bq[b] : j == 1 ? Aq[b] : j == 2 ? Bv[b] : Av[b]; };
+    vector<vector<IntFp>> am[4], av[4];
+    for (int j = 0; j < 4 && adam; ++j) { am[j].resize(NB); av[j].resize(NB); for (int b = 0; b < NB; ++b) { am[j][b].assign(prm(j, b).size(), zero); av[j][b].assign(prm(j, b).size(), zero); } }
+    vector<Mat> cx(NBATCH, Mat(S)), onehot(NBATCH, Mat(T, vector<IntFp>(V)));
     auto commit_onehot = [&](vector<IntFp> &row, int id) {
       vector<uint64_t> raw(V, 0);
       if (party == ALICE) raw[id] = 1;
       batch_feed(row.data(), raw.data(), V);
     };
     vector<IntFp> cnfg, cnfb;
-    if (real) {
-      // tokens 0..S committed one-hot; rows S-T+1..S double as the labels, whose one-hot form
-      // cross_entropy_private proves each step, so rows 0..S-T are proven here
+    if (real) for (int k = 0; k < NBATCH; ++k) {
+      // tokens 0..S of sequence k committed one-hot; rows S-T+1..S double as the labels, whose
+      // one-hot form cross_entropy_private proves each step, so rows 0..S-T are proven here
       Mat oh(S + 1, vector<IntFp>(V));
-      for (int i = 0; i <= S; ++i) commit_onehot(oh[i], ids[i]);
+      for (int i = 0; i <= S; ++i) commit_onehot(oh[i], ids[(size_t)k * S + i]);
       for (int i = 0; i <= S - T; ++i) {
         vector<IntFp> om1(V);
         IntFp sum(0ULL, PUBLIC);
@@ -262,15 +287,15 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       for (int i = 0; i < S; ++i) ohf.insert(ohf.end(), oh[i].begin(), oh[i].end());
       mm_seq(&qi, raw, ohf, pubv(We), S, D, V);
       for (int i = 0; i < S; ++i) {
-        cx[i].resize(D);
-        for (int k = 0; k < D; ++k) cx[i][k] = raw[(size_t)i * D + k] + IntFp(enc(wpe[(size_t)i * D + k]), PUBLIC);
+        cx[k][i].resize(D);
+        for (int cc = 0; cc < D; ++cc) cx[k][i][cc] = raw[(size_t)i * D + cc] + IntFp(enc(wpe[(size_t)i * D + cc]), PUBLIC);
       }
-      for (int t = 0; t < T; ++t) onehot[t] = std::move(oh[S - T + 1 + t]);
-      cnfg = pubv(lnfg); cnfb = pubv(lnfb);
-    } else {
-      for (int i = 0; i < S; ++i) qi.commit_vec(cx[i], vector<int64_t>(xq.begin() + (size_t)i * D, xq.begin() + (size_t)(i + 1) * D));
-      for (int t = 0; t < T; ++t) commit_onehot(onehot[t], label[t]);
+      for (int t = 0; t < T; ++t) onehot[k][t] = std::move(oh[S - T + 1 + t]);
+    } else for (int k = 0; k < NBATCH; ++k) {
+      for (int i = 0; i < S; ++i) qi.commit_vec(cx[k][i], vector<int64_t>(xq[k].begin() + (size_t)i * D, xq[k].begin() + (size_t)(i + 1) * D));
+      for (int t = 0; t < T; ++t) commit_onehot(onehot[k][t], label[k][t]);
     }
+    if (real) { cnfg = pubv(lnfg); cnfb = pubv(lnfb); }
     printf("[%d] committed (%.1fs)\n", party, secs(t0));
 
     // ---- prover-local checking helpers (ALICE reads her own witnesses; nothing is revealed) ----
@@ -360,8 +385,12 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       if (!good) ok = false;
     };
 
+    // float AdamW moments of the references (CHECK): on the float gradient (fm, fv) and on the
+    // proven gradient (pm, pv) -- the second isolates the AdamW gadget's own rounding
+    vector<vector<double>> fm[4], fv[4], pm[4], pv[4];
+    for (int j = 0; j < 4; ++j) { fm[j].resize(NB); fv[j].resize(NB); pm[j].resize(NB); pv[j].resize(NB); }
     for (int step = 0; step < STEPS; ++step) {
-      auto ts = chrono::steady_clock::now();
+      auto tw = chrono::steady_clock::now();
       // ================= W_eff from the committed adapters =================
       vector<Mat> WQe(NB), WVe(NB);
       for (int b = 0; b < NB; ++b) { lora.effective(WQe[b], cWq[b], Bq[b], Aq[b]); lora.effective(WVe[b], cWv[b], Bv[b], Av[b]); }
@@ -384,137 +413,227 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
         chk_s += secs(tc);
       }
 
-      // ================= PROVEN FORWARD =================
-      Mat Hc = cx;
-      for (int b = 0; b < NB; ++b) {
-        ln1[b]->save_intermediates = ln2[b]->save_intermediates = attn[b]->save_intermediates = tblk[b]->save_intermediates = true;
-        ln1[b]->clear_cache(); ln2[b]->clear_cache(); attn[b]->clear_cache(); tblk[b]->clear_cache();
-        Mat Ho;
-        tblk[b]->forward_seq(Ho, Hc, cg1[b], cb1n[b], cg2[b], cb2n[b], WQe[b], cbq[b], cWk[b], cbk[b], WVe[b], cbv[b], cWo[b], cbo[b], cW1[b], cb1[b], cW2[b], cb2[b]);
-        Hc = Ho;
-      }
-      const double t_fwd = secs(ts);
-      if (CHECK && party == ALICE) { // the GELU table only covers |x| < GOFF (real 128)
-        int64_t mh = 0;
-        for (int b = 0; b < NB; ++b) for (auto &row : tblk[b]->cache["hidden"]) for (auto &z : row) mh = max(mh, std::abs(dq(z)));
-        printf("[1] step %d  max |pre-GELU| %.2f (table covers %.0f)  %s\n", step, mh / SCALE, GOFF / SCALE, mh < GOFF ? "ok" : "OUT OF RANGE");
-        if (mh >= GOFF) ok = false;
-      }
-      // LM head + cross-entropy over the last T positions (private labels)
-      auto th = chrono::steady_clock::now();
-      Mat Hl(Hc.end() - T, Hc.end()), Lg, pr(T), dl(T), dHl;
-      if (real) { lnf.clear_cache(); for (auto &row : Hl) { vector<IntFp> o; lnf.forward(o, row, cnfg, cnfb); row = std::move(o); } }
-      qi.dense_layer_mm(Lg, cWe, cbe, Hl);
-      for (int t = 0; t < T; ++t) { pr[t] = sm.forward(Lg[t]); sbk.cross_entropy_private(dl[t], pr[t], onehot[t]); }
-      lmb.input_grad(dHl, dl, cWe);
-      Mat dLdH(S, vector<IntFp>(D, zero));
-      for (int t = 0; t < T; ++t) {
-        if (real) { vector<IntFp> dg, db; lnb.forward(dLdH[S - T + t], dg, db, dHl[t], lnf.cache_mat["c"][t], cnfg, lnf.cache_scalar_vec["dinv"][t], D); }
-        else dLdH[S - T + t] = dHl[t];
-      }
-      const double t_head = secs(th);
-      if (CHECK && party == ALICE) {
-        auto tc = chrono::steady_clock::now();
-        size_t bad_dl = 0, bad_dh = 0; double perr = 0, loss = 0;
-        int wt = 0, wv = 0; double wgot = 0, wref = 0, wspread = 0;
-        vector<vector<int64_t>> dlq(T);
+      // ================= PER SEQUENCE: FORWARD, HEAD, BACKWARD =================
+      double t_fwd = secs(tw), t_head = 0, t_bwd = 0;
+      vector<vector<IntFp>> dWqs(NB), dWvs(NB);   // dL/dW_eff summed over the batch (2^-(P+G))
+      vector<vector<double>> gWqs(NB), gWvs(NB);  // float reference of the same sums (CHECK)
+      for (int k = 0; k < NBATCH; ++k) {
+        auto ts = chrono::steady_clock::now();
+        Mat Hc = cx[k];
+        for (int b = 0; b < NB; ++b) {
+          ln1[b]->save_intermediates = ln2[b]->save_intermediates = attn[b]->save_intermediates = tblk[b]->save_intermediates = true;
+          ln1[b]->clear_cache(); ln2[b]->clear_cache(); attn[b]->clear_cache(); tblk[b]->clear_cache();
+          Mat Ho;
+          tblk[b]->forward_seq(Ho, Hc, cg1[b], cb1n[b], cg2[b], cb2n[b], WQe[b], cbq[b], cWk[b], cbk[b], WVe[b], cbv[b], cWo[b], cbo[b], cW1[b], cb1[b], cW2[b], cb2[b]);
+          Hc = Ho;
+        }
+        t_fwd += secs(ts);
+        if (CHECK && party == ALICE) { // the GELU table only covers |x| < GOFF (real 128)
+          int64_t mh = 0;
+          for (int b = 0; b < NB; ++b) for (auto &row : tblk[b]->cache["hidden"]) for (auto &z : row) mh = max(mh, std::abs(dq(z)));
+          printf("[1] step %d seq %d  max |pre-GELU| %.2f (table covers %.0f)  %s\n", step, k, mh / SCALE, GOFF / SCALE, mh < GOFF ? "ok" : "OUT OF RANGE");
+          if (mh >= GOFF) ok = false;
+        }
+        // LM head + cross-entropy over the last T positions (private labels)
+        auto th = chrono::steady_clock::now();
+        Mat Hl(Hc.end() - T, Hc.end()), Lg, pr(T), dl(T), dHl;
+        if (real) { lnf.clear_cache(); for (auto &row : Hl) { vector<IntFp> o; lnf.forward(o, row, cnfg, cnfb); row = std::move(o); } }
+        qi.dense_layer_mm(Lg, cWe, cbe, Hl);
+        for (int t = 0; t < T; ++t) { pr[t] = sm.forward(Lg[t]); sbk.cross_entropy_private(dl[t], pr[t], onehot[k][t]); }
+        lmb.input_grad(dHl, dl, cWe);
+        Mat dLdH(S, vector<IntFp>(D, zero));
         for (int t = 0; t < T; ++t) {
-          const vector<int64_t> lq = dqv(Lg[t]), pq = dqv(pr[t]);
-          dlq[t] = dqv(dl[t]);
-          double mx = -1e300, sum = 0;
-          for (int v = 0; v < V; ++v) mx = max(mx, lq[v] / SCALE);
-          for (int v = 0; v < V; ++v) sum += exp(lq[v] / SCALE - mx);
-          double mn = 1e300;
-          for (int v = 0; v < V; ++v) mn = min(mn, lq[v] / SCALE);
-          for (int v = 0; v < V; ++v) {
-            const double ref = exp(lq[v] / SCALE - mx) / sum;
-            if (fabs(pq[v] / SCALE - ref) > perr) { perr = fabs(pq[v] / SCALE - ref); wt = t; wv = v; wgot = pq[v] / SCALE; wref = ref; wspread = mx - mn; }
-            if (dlq[t][v] != pq[v] - (v == label[t] ? (int64_t)SCALE : 0)) ++bad_dl;
-          }
-          loss += -(lq[label[t]] / SCALE - mx - log(sum));
+          if (real) { vector<IntFp> dg, db; lnb.forward(dLdH[S - T + t], dg, db, dHl[t], lnf.cache_mat["c"][t], cnfg, lnf.cache_scalar_vec["dinv"][t], D); }
+          else dLdH[S - T + t] = dHl[t];
         }
-        vector<size_t> bad_t(T, 0);
-        parallel_for(T, threads, [&](size_t t) {
-          for (int k = 0; k < D; ++k) {
-            __int128 acc = 0;
-            for (int v = 0; v < V; ++v) acc += (__int128)dlq[t][v] * We[(size_t)v * D + k];
-            if (dq(dHl[t][k]) != rhu128(acc, P)) ++bad_t[t];
-          }
-        });
-        for (size_t x : bad_t) bad_dh += x;
-        const bool hok = bad_dl == 0 && bad_dh == 0 && perr <= 0.01;
-        printf("[1] step %d  loss head: mean CE %.4f | softmax max|err| %.5f | dL/dlogits exact: %zu mismatches | dL/dH exact: %zu mismatches  %s\n",
-               step, loss / T, perr, bad_dl, bad_dh, hok ? "ok" : "FAIL");
-        if (perr > 0.01) printf("[1]   softmax worst: pos %d token %d  proven %.5f  float %.5f  (row max-min logit %.1f)\n", wt, wv, wgot, wref, wspread);
-        if (!hok) ok = false;
-        if (real) { // ln_f backward against the float formula on its own cached c / dinv
-          vector<double> got, ref, gf(D), dx(D);
-          for (int k = 0; k < D; ++k) gf[k] = lnfg[k] / SCALE;
-          const vector<double> cf = dqf(lnf.cache_mat["c"]), dyf = dqf(dHl);
-          for (int t = 0; t < T; ++t) {
-            ln_bwd(&dyf[(size_t)t * D], &cf[(size_t)t * D], dq(lnf.cache_scalar_vec["dinv"][t]) / SCALE, gf.data(), dx.data());
-            for (int k = 0; k < D; ++k) { got.push_back(dq(dLdH[S - T + t][k]) / SCALE); ref.push_back(dx[k]); }
-          }
-          cmpf("ln_f dL/dH", NB, got, ref);
-        }
-        chk_s += secs(tc);
-      }
-
-      // ================= BACKWARD CHAIN + ADAPTER SGD =================
-      auto tb = chrono::steady_clock::now();
-      size_t nzB = 0, nzA = 0, nB = 0, nA = 0;
-      for (int b = NB - 1; b >= 0; --b) {
-        Mat dLdx;
-        vector<IntFp> dWq, dWv;
-        bwd[b]->forward(dLdx, dWq, dWv, dLdH, *ln1[b], *ln2[b], *attn[b], *tblk[b], WQe[b], cWk[b], WVe[b], cWo[b], cW1[b], cW2[b], cg1[b], cg2[b]);
-        vector<IntFp> Bq2, Aq2, Bv2, Av2;
-        lora.sgd_step(Bq2, Aq2, Bq[b], Aq[b], dWq);
-        lora.sgd_step(Bv2, Av2, Bv[b], Av[b], dWv);
+        t_head += secs(th);
         if (CHECK && party == ALICE) {
           auto tc = chrono::steady_clock::now();
-          vector<double> gWq, gWv, gX;
-          block_ref(b, dqf(dLdH), dqf(WQe[b]), dqf(WVe[b]), gWq, gWv, gX);
-          vector<double> fq(dWq.size()), fv(dWv.size());
-          const double GS = SCALE * std::ldexp(1.0, (int)G); // dL/dW_eff scale 2^(P+G)
-          for (size_t i = 0; i < fq.size(); ++i) { fq[i] = dq(dWq[i]) / GS; fv[i] = dq(dWv[i]) / GS; }
-          cmpf("dL/dWq", b, fq, gWq); cmpf("dL/dWv", b, fv, gWv); cmpf("dL/dx", b, dqf(dLdx), gX);
-          // adapter step: exact replay + effect
-          for (int which = 0; which < 2; ++which) {
-            const vector<int64_t> Bp = dqv(which ? Bv[b] : Bq[b]), Ap = dqv(which ? Av[b] : Aq[b]);
-            const vector<int64_t> dW = dqv(which ? dWv : dWq), Bn = dqv(which ? Bv2 : Bq2), An = dqv(which ? Av2 : Aq2);
-            const vector<double> &gW = which ? gWv : gWq;
-            size_t bad = 0;
-            vector<double> uB((size_t)D * R), iB((size_t)D * R, 0.0), uA((size_t)R * D), iA((size_t)R * D, 0.0);
-            for (int i = 0; i < D; ++i) for (int k = 0; k < R; ++k) {
-              __int128 acc = 0; double fl = 0;
-              for (int j = 0; j < D; ++j) { acc += (__int128)dW[(size_t)i * D + j] * Ap[(size_t)k * D + j]; fl += gW[(size_t)i * D + j] * Ap[(size_t)k * D + j] / MS; }
-              const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)i * R + k;
-              if (Bn[t] != Bp[t] - u) ++bad;
-              uB[t] = u / MS; iB[t] = eta * lscale * fl; nzB += u != 0;
+          size_t bad_dl = 0, bad_dh = 0; double perr = 0, loss = 0;
+          int wt = 0, wv = 0; double wgot = 0, wref = 0, wspread = 0;
+          vector<vector<int64_t>> dlq(T);
+          for (int t = 0; t < T; ++t) {
+            const vector<int64_t> lq = dqv(Lg[t]), pq = dqv(pr[t]);
+            dlq[t] = dqv(dl[t]);
+            double mx = -1e300, sum = 0;
+            for (int v = 0; v < V; ++v) mx = max(mx, lq[v] / SCALE);
+            for (int v = 0; v < V; ++v) sum += exp(lq[v] / SCALE - mx);
+            double mn = 1e300;
+            for (int v = 0; v < V; ++v) mn = min(mn, lq[v] / SCALE);
+            for (int v = 0; v < V; ++v) {
+              const double ref = exp(lq[v] / SCALE - mx) / sum;
+              if (fabs(pq[v] / SCALE - ref) > perr) { perr = fabs(pq[v] / SCALE - ref); wt = t; wv = v; wgot = pq[v] / SCALE; wref = ref; wspread = mx - mn; }
+              if (dlq[t][v] != pq[v] - (v == label[k][t] ? (int64_t)SCALE : 0)) ++bad_dl;
             }
-            for (int k = 0; k < R; ++k) for (int j = 0; j < D; ++j) {
-              __int128 acc = 0; double fl = 0;
-              for (int i = 0; i < D; ++i) { acc += (__int128)Bp[(size_t)i * R + k] * dW[(size_t)i * D + j]; fl += Bp[(size_t)i * R + k] / MS * gW[(size_t)i * D + j]; }
-              const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)k * D + j;
-              if (An[t] != Ap[t] - u) ++bad;
-              uA[t] = u / MS; iA[t] = eta * lscale * fl; nzA += u != 0;
+            loss += -(lq[label[k][t]] / SCALE - mx - log(sum));
+          }
+          vector<size_t> bad_t(T, 0);
+          parallel_for(T, threads, [&](size_t t) {
+            for (int cc = 0; cc < D; ++cc) {
+              __int128 acc = 0;
+              for (int v = 0; v < V; ++v) acc += (__int128)dlq[t][v] * We[(size_t)v * D + cc];
+              if (dq(dHl[t][cc]) != rhu128(acc, P)) ++bad_t[t];
             }
-            nB += uB.size(); nA += uA.size();
-            printf("[1]   blk%-2d adapter %c: SGD exact replay %zu mismatches | cos(update, float update) B %.4f  A %.4f\n",
-                   b, which ? 'V' : 'Q', bad, cosine(uB, iB), cosine(uA, iA));
-            if (bad) ok = false;
+          });
+          for (size_t x : bad_t) bad_dh += x;
+          const bool hok = bad_dl == 0 && bad_dh == 0 && perr <= 0.01;
+          printf("[1] step %d seq %d  loss head: mean CE %.4f | softmax max|err| %.5f | dL/dlogits exact: %zu mismatches | dL/dH exact: %zu mismatches  %s\n",
+                 step, k, loss / T, perr, bad_dl, bad_dh, hok ? "ok" : "FAIL");
+          if (perr > 0.01) printf("[1]   softmax worst: pos %d token %d  proven %.5f  float %.5f  (row max-min logit %.1f)\n", wt, wv, wgot, wref, wspread);
+          if (!hok) ok = false;
+          if (real) { // ln_f backward against the float formula on its own cached c / dinv
+            vector<double> got, ref, gf(D), dx(D);
+            for (int cc = 0; cc < D; ++cc) gf[cc] = lnfg[cc] / SCALE;
+            const vector<double> cf = dqf(lnf.cache_mat["c"]), dyf = dqf(dHl);
+            for (int t = 0; t < T; ++t) {
+              ln_bwd(&dyf[(size_t)t * D], &cf[(size_t)t * D], dq(lnf.cache_scalar_vec["dinv"][t]) / SCALE, gf.data(), dx.data());
+              for (int cc = 0; cc < D; ++cc) { got.push_back(dq(dLdH[S - T + t][cc]) / SCALE); ref.push_back(dx[cc]); }
+            }
+            cmpf("ln_f dL/dH", NB, got, ref);
           }
           chk_s += secs(tc);
         }
-        Bq[b] = Bq2; Aq[b] = Aq2; Bv[b] = Bv2; Av[b] = Av2;
-        dLdH = dLdx;
+
+        // backward chain; each block's dL/dW_eff goes into the batch sum
+        auto tb = chrono::steady_clock::now();
+        for (int b = NB - 1; b >= 0; --b) {
+          Mat dLdx;
+          vector<IntFp> dWq, dWv;
+          bwd[b]->forward(dLdx, dWq, dWv, dLdH, *ln1[b], *ln2[b], *attn[b], *tblk[b], WQe[b], cWk[b], WVe[b], cWo[b], cW1[b], cW2[b], cg1[b], cg2[b]);
+          if (CHECK && party == ALICE) {
+            auto tc = chrono::steady_clock::now();
+            vector<double> gWq, gWv, gX;
+            block_ref(b, dqf(dLdH), dqf(WQe[b]), dqf(WVe[b]), gWq, gWv, gX);
+            vector<double> fq(dWq.size()), fv(dWv.size());
+            const double GS = SCALE * std::ldexp(1.0, (int)G); // dL/dW_eff scale 2^(P+G)
+            for (size_t i = 0; i < fq.size(); ++i) { fq[i] = dq(dWq[i]) / GS; fv[i] = dq(dWv[i]) / GS; }
+            cmpf("dL/dWq", b, fq, gWq); cmpf("dL/dWv", b, fv, gWv); cmpf("dL/dx", b, dqf(dLdx), gX);
+            if (k == 0) { gWqs[b] = std::move(gWq); gWvs[b] = std::move(gWv); }
+            else for (size_t i = 0; i < gWq.size(); ++i) { gWqs[b][i] += gWq[i]; gWvs[b][i] += gWv[i]; }
+            chk_s += secs(tc);
+          }
+          if (k == 0) { dWqs[b] = std::move(dWq); dWvs[b] = std::move(dWv); }
+          else for (size_t i = 0; i < dWq.size(); ++i) { dWqs[b][i] = dWqs[b][i] + dWq[i]; dWvs[b][i] = dWvs[b][i] + dWv[i]; }
+          dLdH = dLdx;
+        }
+        t_bwd += secs(tb);
       }
-      const double t_bwd = secs(tb);
+
+      // ================= ADAPTER UPDATE (one per step, on the batch-mean loss) =================
+      auto to = chrono::steady_clock::now();
+      size_t nzB = 0, nzA = 0, nB = 0, nA = 0;
+      double hr = 0; // largest |requant input| of the gradient rescale, log2 (must stay < 59)
+      double gtop = 0; // largest |AdamW gradient|
+      for (int b = 0; b < NB; ++b) {
+        if (!adam) {
+          vector<IntFp> Bq2, Aq2, Bv2, Av2;
+          lora.sgd_step(Bq2, Aq2, Bq[b], Aq[b], dWqs[b]);
+          lora.sgd_step(Bv2, Av2, Bv[b], Av[b], dWvs[b]);
+          if (CHECK && party == ALICE) {
+            auto tc = chrono::steady_clock::now();
+            // adapter step: exact replay + effect
+            for (int which = 0; which < 2; ++which) {
+              const vector<int64_t> Bp = dqv(which ? Bv[b] : Bq[b]), Ap = dqv(which ? Av[b] : Aq[b]);
+              const vector<int64_t> dW = dqv(which ? dWvs[b] : dWqs[b]), Bn = dqv(which ? Bv2 : Bq2), An = dqv(which ? Av2 : Aq2);
+              const vector<double> &gW = which ? gWvs[b] : gWqs[b];
+              size_t bad = 0;
+              vector<double> uB((size_t)D * R), iB((size_t)D * R, 0.0), uA((size_t)R * D), iA((size_t)R * D, 0.0);
+              for (int i = 0; i < D; ++i) for (int kk = 0; kk < R; ++kk) {
+                __int128 acc = 0; double fl = 0;
+                for (int j = 0; j < D; ++j) { acc += (__int128)dW[(size_t)i * D + j] * Ap[(size_t)kk * D + j]; fl += gW[(size_t)i * D + j] * Ap[(size_t)kk * D + j] / MS; }
+                hr = max(hr, log2(fabs((double)acc) * lora.g_c + 1));
+                const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)i * R + kk;
+                if (Bn[t] != Bp[t] - u) ++bad;
+                uB[t] = u / MS; iB[t] = eta * lscale * fl; nzB += u != 0;
+              }
+              for (int kk = 0; kk < R; ++kk) for (int j = 0; j < D; ++j) {
+                __int128 acc = 0; double fl = 0;
+                for (int i = 0; i < D; ++i) { acc += (__int128)Bp[(size_t)i * R + kk] * dW[(size_t)i * D + j]; fl += Bp[(size_t)i * R + kk] / MS * gW[(size_t)i * D + j]; }
+                hr = max(hr, log2(fabs((double)acc) * lora.g_c + 1));
+                const int64_t u = rhu128(acc * (__int128)lora.g_c, lora.g_M), t = (size_t)kk * D + j;
+                if (An[t] != Ap[t] - u) ++bad;
+                uA[t] = u / MS; iA[t] = eta * lscale * fl; nzA += u != 0;
+              }
+              nB += uB.size(); nA += uA.size();
+              printf("[1]   blk%-2d adapter %c: SGD exact replay %zu mismatches | cos(update, float update) B %.4f  A %.4f\n",
+                     b, which ? 'V' : 'Q', bad, cosine(uB, iB), cosine(uA, iA));
+              if (bad) ok = false;
+            }
+            chk_s += secs(tc);
+          }
+          Bq[b] = Bq2; Aq[b] = Aq2; Bv[b] = Bv2; Av[b] = Av2;
+        } else {
+          vector<IntFp> raw[4];
+          lora.raw_grads(raw[0], raw[1], Bq[b], Aq[b], dWqs[b]);
+          lora.raw_grads(raw[2], raw[3], Bv[b], Av[b], dWvs[b]);
+          vector<int64_t> old[4];   // pre-step adapters (the float gradients use the old B and A)
+          if (CHECK && party == ALICE) for (int j = 0; j < 4; ++j) old[j] = dqv(prm(j, b));
+          for (int j = 0; j < 4; ++j) {
+            vector<IntFp> &th = prm(j, b), th2;
+            vector<int64_t> th0, m0, v0, rw;
+            if (party == ALICE) { // the gradient must fit the AdamW window (prover-side, before proving)
+              const FixedAdamW::StepConst kc = adam->consts(gscale, step + 1);
+              double gmax = 0;
+              for (auto &z : raw[j]) gmax = max(gmax, fabs((double)dq(z)) * kc.cg / std::ldexp(1.0, (int)kc.Mg));
+              if (gmax >= std::ldexp(1.0, 29)) error("AdamW: |gradient| exceeds the ADAM_GRAD_BITS window -- lower ADAM_GRAD_BITS\n");
+              gtop = max(gtop, gmax / std::ldexp(1.0, (int)adam->Fg));
+            }
+            if (CHECK && party == ALICE) { th0 = dqv(th); m0 = dqv(am[j][b]); v0 = dqv(av[j][b]); rw = dqv(raw[j]); }
+            adam->step(th2, am[j][b], av[j][b], th, raw[j], gscale, step + 1);
+            if (CHECK && party == ALICE) {
+              auto tc = chrono::steady_clock::now();
+              // exact replay of the whole AdamW step, then the float AdamW update from the float
+              // gradient (its own float moments, the proven old parameters)
+              vector<int64_t> thr, mr = m0, vr = v0;
+              adam->replay(thr, mr, vr, th0, rw, gscale, step + 1);
+              const vector<int64_t> thn = dqv(th2), mn = dqv(am[j][b]), vn = dqv(av[j][b]);
+              size_t bad = 0;
+              for (size_t i = 0; i < th0.size(); ++i) bad += (thn[i] != thr[i]) + (mn[i] != mr[i]) + (vn[i] != vr[i]);
+              const FixedAdamW::StepConst kc = adam->consts(gscale, step + 1);
+              for (int64_t x : rw) hr = max(hr, log2(fabs((double)x) * kc.cg + 1));
+              // float gradient of this adapter from the float dL/dW_eff sum
+              const bool isB = j % 2 == 0;
+              const vector<double> &gW = j < 2 ? gWqs[b] : gWvs[b];
+              const vector<int64_t> &other = old[isB ? j + 1 : j - 1]; // A for B's gradient, B for A's
+              if (fm[j][b].empty()) for (auto *x : {&fm[j][b], &fv[j][b], &pm[j][b], &pv[j][b]}) x->assign(th0.size(), 0.0);
+              vector<double> up(th0.size()), uf(th0.size()), ug(th0.size());
+              const double gp_s = gscale / std::ldexp(1.0, (int)(2 * P + E + G)); // proven raw -> real gradient
+              const double bc1 = 1 - pow(AB1, step + 1), bc2 = 1 - pow(AB2, step + 1);
+              for (size_t t = 0; t < th0.size(); ++t) {
+                double g = 0;
+                if (isB) { const size_t i = t / R, kk = t % R; for (int jj = 0; jj < D; ++jj) g += gW[i * D + jj] * other[(size_t)kk * D + jj] / MS; }
+                else { const size_t kk = t / D, jj = t % D; for (int i = 0; i < D; ++i) g += other[(size_t)i * R + kk] / MS * gW[(size_t)i * D + jj]; }
+                g *= gscale;
+                fm[j][b][t] = AB1 * fm[j][b][t] + (1 - AB1) * g;
+                fv[j][b][t] = AB2 * fv[j][b][t] + (1 - AB2) * g * g;
+                uf[t] = LR * ((fm[j][b][t] / bc1) / (sqrt(fv[j][b][t] / bc2) + AEPS) + WD * th0[t] / MS);
+                const double gp = rw[t] * gp_s;
+                pm[j][b][t] = AB1 * pm[j][b][t] + (1 - AB1) * gp;
+                pv[j][b][t] = AB2 * pv[j][b][t] + (1 - AB2) * gp * gp;
+                ug[t] = LR * ((pm[j][b][t] / bc1) / (sqrt(pv[j][b][t] / bc2) + AEPS) + WD * th0[t] / MS);
+                up[t] = (th0[t] - thn[t]) / MS;
+                (isB ? nzB : nzA) += thn[t] != th0[t];
+              }
+              (isB ? nB : nA) += th0.size();
+              printf("[1]   blk%-2d adapter %c%c: AdamW exact replay %zu mismatches | cos(update, float AdamW on proven grad) %.5f | cos(update, float update) %.4f\n",
+                     b, isB ? 'B' : 'A', j < 2 ? 'q' : 'v', bad, cosine(up, ug), cosine(up, uf));
+              if (bad) ok = false;
+              chk_s += secs(tc);
+            }
+            th = std::move(th2);
+          }
+        }
+      }
+      const double t_opt = secs(to);
       if (CHECK && party == ALICE)
-        printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%)\n", step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA);
-      printf("[%d] step %d done: W_eff+forward %.1fs, head %.1fs, backward+SGD %.1fs (wall incl. prover checks)\n", party, step, t_fwd, t_head, t_bwd);
+        printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%) | gradient rescale input up to 2^%.1f (limit 2^59)%s\n",
+               step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA, hr,
+               adam ? (" | max |g| " + to_string(gtop)).c_str() : "");
+      printf("[%d] step %d done: W_eff+forward %.1fs, head %.1fs, backward %.1fs, %s %.1fs (wall incl. prover checks)\n",
+             party, step, t_fwd, t_head, t_bwd, adam ? "AdamW" : "SGD", t_opt);
     }
 
+    if (adam) { adam->destroy(); delete adam; }
     gelu_bwd.Teardown();
     gtab.Teardown(); expt.Teardown(); expt_head.Teardown(); rclu.Teardown(); divr_sm.destroy(); divr_head.destroy(); divr_ln.destroy(); qi.destroy();
   }

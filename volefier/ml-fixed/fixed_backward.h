@@ -695,18 +695,151 @@ public:
       for (std::size_t j = 0; j < din; ++j) W_eff[i][j] = W[i][j] + delta[i * din + j];
   }
 
+  // Unscaled adapter gradients from dL/dW_eff (dout x din, 2^-(P+G)), at 2^-(2P+E+G):
+  // rawB = dW_eff @ A^T, rawA = B^T @ dW_eff.  dL/dB = (alpha/r) rawB, dL/dA = (alpha/r) rawA.
+  void raw_grads(std::vector<IntFp> &rawB, std::vector<IntFp> &rawA, const std::vector<IntFp> &B,
+                 const std::vector<IntFp> &A, const std::vector<IntFp> &dWeff) const {
+    mm_seq(qi, rawB, dWeff, transpose_of(A, r, din), dout, r, din);
+    mm_seq(qi, rawA, transpose_of(B, dout, r), dWeff, r, din, dout);
+  }
+
   // One SGD step on both adapters from dL/dW_eff (dout x din, 2^-(P+G)); both use the OLD B, A.
   void sgd_step(std::vector<IntFp> &B_new, std::vector<IntFp> &A_new, const std::vector<IntFp> &B,
                 const std::vector<IntFp> &A, const std::vector<IntFp> &dWeff) const {
     std::vector<IntFp> rawB, rawA, uB, uA;
-    mm_seq(qi, rawB, dWeff, transpose_of(A, r, din), dout, r, din); // dW_eff @ A^T
-    mm_seq(qi, rawA, transpose_of(B, dout, r), dWeff, r, din, dout); // B^T @ dW_eff
+    raw_grads(rawB, rawA, B, A, dWeff);
     qi->requant_cm(uB, rawB, g_c, g_M);
     qi->requant_cm(uA, rawA, g_c, g_M);
     B_new.resize(B.size());
     A_new.resize(A.size());
     for (std::size_t t = 0; t < B.size(); ++t) B_new[t] = B[t] + uB[t].negate();
     for (std::size_t t = 0; t < A.size(); ++t) A_new[t] = A[t] + uA[t].negate();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// AdamW on committed parameters theta (scale 2^-Ft) with committed BIAS-CORRECTED moments
+// m (= m_hat, 2^-Fg) and v (= v_hat, 2^-Fv), carried from step to step.  Updating m_hat directly,
+//   m_hat_t = m_hat_{t-1} + a_t (g - m_hat_{t-1}),  a_t = (1-b1) / (1-b1^t)   (likewise v_hat, b2),
+// is the same recurrence as AdamW's m_t = b1 m_{t-1} + (1-b1) g followed by m_t / (1-b1^t), and
+// keeps v_hat ~ g^2 from step 1 instead of (1-b2) g^2, so its fixed-point resolution is not lost.
+// Per element, from a raw gradient at 2^-Fin whose real value is gscale * raw:
+//   g      = round(raw * gscale * 2^(Fg-Fin))                  |g| < 2^(29-Fg)
+//   m'     = m + round(a1_t (g - m))
+//   v'     = v + round(a2_t (round(g^2 / 2^(2Fg-Fv)) - v))      v' in [0, 2^Vb), Fv = 2Fg - 10
+//   s      = round(sqrt(v' 2^2K))                               sqrt(v') at 2^-(Fv/2+K)
+//   r      = round(m' 2^Fr / (s + e))                           m'/(sqrt(v')+eps) at 2^-Fr
+//   theta' = theta - round(r * lr 2^(Ft-Fr)) - round(theta * lr wd)
+// Fg (default 28) places the window of representable gradient magnitudes, ~[2^-(Fg-5), 2^(29-Fg)),
+// like a loss scale; a gradient past its top makes the proof fail.  Every rescale is
+// FixedInfer::requant_cm; s is proven as in prove_rsqrt (|v' 2^2K - s^2| <= s, exact range
+// checks, s^2 < 2^60), r by Div::round_div with the committed divisor s + e.  a1_t, a2_t, lr and
+// lr wd are 10-significant-bit constants (LoRAAdapter::to_fixed); e is eps at the scale of s,
+// at least 1.
+class FixedAdamW {
+public:
+  FixedInfer *qi;
+  RangeCheckLU *rc;
+  Div *div;
+  std::size_t Ft, Fin, Fg, Fv, Vb = 48, K, Sb, Fr = 16;
+  double lr, b1, b2, eps, wd;
+  uint64_t cu, cw = 0, e;
+  std::size_t Mu, Mw = 0;
+
+  // the moment coefficients a1_t, a2_t of step t
+  struct StepConst { uint64_t cg, c1, c2; std::size_t Mg, M1, M2; };
+
+  FixedAdamW(FixedInfer *qi_, RangeCheckLU *rc_, std::size_t Ft_, std::size_t Fin_, double lr_,
+             double b1_ = 0.9, double b2_ = 0.999, double eps_ = 1e-8, double wd_ = 0.01,
+             std::size_t Fg_ = 28)
+      : qi(qi_), rc(rc_), Ft(Ft_), Fin(Fin_), Fg(Fg_), Fv(2 * Fg_ - 10), lr(lr_), b1(b1_), b2(b2_), eps(eps_), wd(wd_) {
+    K = 29 - (Vb + 1) / 2;   // s < 2^Sb = 2^30, s^2 < 2^60; v' 2^2K < 2^58
+    Sb = (Vb + 1) / 2 + K + 1;
+    LoRAAdapter::to_fixed(lr * std::ldexp(1.0, (int)Ft - (int)Fr), cu, Mu);
+    if (wd > 0) LoRAAdapter::to_fixed(lr * wd, cw, Mw);
+    e = std::max<uint64_t>(1, llround(eps * std::ldexp(1.0, (int)(Fv / 2 + K))));
+    div = new Div(qi->party, qi->io, Sb + 2);   // divisor s + e, 2(s + e) < 2^(Sb+2)
+  }
+  ~FixedAdamW() { delete div; }
+  void destroy() { div->destroy(); }   // before finalize_zk_arith
+
+  StepConst consts(double gscale, int t) const {
+    StepConst k{};
+    LoRAAdapter::to_fixed(gscale * std::ldexp(1.0, (int)Fg - (int)Fin), k.cg, k.Mg);
+    LoRAAdapter::to_fixed((1 - b1) / (1 - std::pow(b1, t)), k.c1, k.M1);
+    LoRAAdapter::to_fixed((1 - b2) / (1 - std::pow(b2, t)), k.c2, k.M2);
+    return k;
+  }
+
+  // One step on a parameter vector; m and v are updated in place.
+  void step(std::vector<IntFp> &th_new, std::vector<IntFp> &m, std::vector<IntFp> &v,
+            const std::vector<IntFp> &th, const std::vector<IntFp> &raw, double gscale, int t) const {
+    const std::size_t n = th.size();
+    const StepConst k = consts(gscale, t);
+    std::vector<IntFp> g, d, upd, gsq, sq(n), s(n);
+    qi->requant_cm(g, raw, k.cg, k.Mg, 30);                          // |g| < 2^29: g^2 < 2^58
+    d.resize(n);
+    for (std::size_t i = 0; i < n; ++i) d[i] = g[i] + m[i].negate();
+    qi->requant_cm(upd, d, k.c1, k.M1);
+    for (std::size_t i = 0; i < n; ++i) { m[i] = m[i] + upd[i]; sq[i] = g[i] * g[i]; }
+    qi->requant_cm(gsq, sq, 1, 2 * Fg - Fv, Vb + 2);                // up to 2^48, like v
+    for (std::size_t i = 0; i < n; ++i) d[i] = gsq[i] + v[i].negate();
+    qi->requant_cm(upd, d, k.c2, k.M2, Vb + 2);
+    for (std::size_t i = 0; i < n; ++i) v[i] = v[i] + upd[i];
+    // s = round(sqrt(v * 2^2K))
+    std::vector<uint64_t> sraw(n, 0);
+    if (qi->party == ALICE)
+      for (std::size_t i = 0; i < n; ++i) {
+        const int64_t vv = FixedInfer::decode_signed(static_cast<uint64_t>(VAL(v[i].value)));
+        if (vv < 0 || vv >> Vb) error("FixedAdamW: v outside [0, 2^Vb)\n");
+        sraw[i] = round_sqrt(static_cast<uint64_t>(vv) << (2 * K));
+      }
+    batch_feed(s.data(), sraw.data(), static_cast<int64_t>(n));
+    std::vector<IntFp> ep(n), en(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const IntFp e = v[i] * (static_cast<uint64_t>(1) << (2 * K)) + (s[i] * s[i]).negate();
+      ep[i] = s[i] + e; en[i] = s[i] + e.negate();
+    }
+    rc->check_batch(v.data(), n, Vb, true);
+    rc->check_batch(s.data(), n, Sb, true);
+    rc->check_batch(ep.data(), n, Sb + 1, true);   // |v 2^2K - s^2| <= s
+    rc->check_batch(en.data(), n, Sb + 1, true);
+    // r = round(m 2^Fr / (s + e)), then the parameter update
+    std::vector<IntFp> r(n), wdv;
+    const IntFp ep_(e, PUBLIC);
+    for (std::size_t i = 0; i < n; ++i) r[i] = div->round_div(m[i] * (static_cast<uint64_t>(1) << Fr), s[i] + ep_);
+    qi->requant_cm(upd, r, cu, Mu);
+    if (wd > 0) qi->requant_cm(wdv, th, cw, Mw);
+    th_new.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      th_new[i] = th[i] + upd[i].negate();
+      if (wd > 0) th_new[i] = th_new[i] + wdv[i].negate();
+    }
+  }
+
+  static uint64_t round_sqrt(uint64_t X) {
+    uint64_t r = static_cast<uint64_t>(sqrtl(static_cast<long double>(X)));
+    while (r * r > X) --r;
+    while ((r + 1) * (r + 1) <= X) ++r;
+    return (X - r * r > r) ? r + 1 : r;   // round: X > r^2 + r  <=>  sqrt(X) > r + 1/2
+  }
+
+  // Plaintext replay of step() on decoded integers (prover-side checks).
+  void replay(std::vector<int64_t> &th_new, std::vector<int64_t> &m, std::vector<int64_t> &v,
+              const std::vector<int64_t> &th, const std::vector<int64_t> &raw, double gscale, int t) const {
+    const StepConst k = consts(gscale, t);
+    auto rhu = [](__int128 N, std::size_t M) { return (int64_t)((N + ((__int128)1 << (M - 1))) >> M); };
+    th_new.resize(th.size());
+    for (std::size_t i = 0; i < th.size(); ++i) {
+      const int64_t g = rhu((__int128)raw[i] * k.cg, k.Mg);
+      m[i] += rhu((__int128)(g - m[i]) * k.c1, k.M1);
+      const int64_t gs = rhu((__int128)g * g, 2 * Fg - Fv);
+      v[i] += rhu((__int128)(gs - v[i]) * k.c2, k.M2);
+      const int64_t sd = (int64_t)round_sqrt((uint64_t)v[i] << (2 * K)) + (int64_t)e;
+      const int64_t N = m[i] * ((int64_t)1 << Fr);
+      const int64_t r = N >= 0 ? (N + sd / 2) / sd : -((-N + sd / 2) / sd);   // Div: half away
+      th_new[i] = th[i] - rhu((__int128)r * cu, Mu) - (wd > 0 ? rhu((__int128)th[i] * cw, Mw) : 0);
+    }
   }
 };
 

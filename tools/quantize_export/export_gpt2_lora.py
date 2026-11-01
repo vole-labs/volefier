@@ -2,7 +2,8 @@
 # (test/ml-fixed/lora_train.h, env GPT2_BIN / TOKENS).
 #   [WIKITEXT_TXT=<train text>] python3 tools/quantize_export/export_gpt2_lora.py [out_dir] [seq] [offset]
 # writes out_dir/gpt2_lora.bin and out_dir/tokens.txt (seq+1 GPT-2 token ids of the WikiText-2
-# train split starting at token `offset`; position t is trained to predict token t+1).
+# train split starting at token `offset`; position t is trained to predict token t+1).  For a
+# mini-batch of B sequences of length L pass seq = B*L.
 # gpt2_lora.bin: "GPT2LORA", int32 NB D H FFN V NPOS, then float32
 #   wte[V,D] wpe[NPOS,D], per block ln1_g ln1_b Wq bq Wk bk Wv bv Wo bo ln2_g ln2_b W1 b1 W2 b2,
 #   then lnf_g lnf_b.  Every matrix is stored dout x din (HF Conv1D keeps din x dout).
@@ -62,14 +63,15 @@ with open(os.path.join(out, "gpt2_lora.bin"), "wb") as f:
     w(a("transformer.ln_f.weight")); w(a("transformer.ln_f.bias"))
 print(f"wrote {out}/gpt2_lora.bin (NB={NB} D={D} H={H} FFN={FFN} V={V}) and {out}/tokens.txt ({seq + 1} ids)")
 
-# float reference on the window
+# float reference on the window (its first NPOS positions: GPT-2's context)
 rng = {"pre_gelu": 0.0, "resid": 0.0}
 hooks = [m.mlp.c_fc.register_forward_hook(lambda m, i, o: rng.__setitem__("pre_gelu", max(rng["pre_gelu"], o.abs().max().item())))
          for m in model.transformer.h]
-x = torch.tensor([ids[:-1]])
+n = min(seq, NPOS)
+x = torch.tensor([ids[:n]])
 with torch.no_grad():
     o = model(x, output_hidden_states=True)
-    ce_t = torch.nn.functional.cross_entropy(o.logits[0], torch.tensor(ids[1:]), reduction="none")
+    ce_t = torch.nn.functional.cross_entropy(o.logits[0], torch.tensor(ids[1:n + 1]), reduction="none")
     ce = ce_t.mean().item()
     print(f"float CE over the first 64 positions alone (causal, so a SEQ=64 run sees the same): {ce_t[:64].mean().item():.4f}")
     rng["resid"] = max(h.abs().max().item() for h in o.hidden_states)

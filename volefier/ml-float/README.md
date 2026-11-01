@@ -18,7 +18,7 @@ bit-level representation, and between fixed-point and floating-point form, all
 within a single proof. The cost of this conversion, rather than the arithmetic
 itself, turns out to dominate everything.
 
-The directory contains four things:
+The directory contains three things:
 
 - A set of **standalone floating-point non-linear functions** — the activation,
   normalization, and softmax operations evaluated exactly in floating point.
@@ -28,22 +28,15 @@ The directory contains four things:
   point throughout and are converted into the field only to run each convolution.
   This was the naive starting point and is kept for comparison.
 
-- A **refined, field-native network** that follows Mystique faithfully.
-  Activations live in the fixed-point field; ReLU and the residual additions are
-  done with integer and field operations; and floating point is used only where
-  it is genuinely required — the per-channel square-root inside batch
-  normalization. Truncating values back to the working scale after each multiply
-  is done with a field range check rather than a floating-point round-trip, and
-  the rescale that follows a layer is folded into the comparison the activation
-  already performs. These choices are what make the faithful version far cheaper
-  than the naive one.
-
 - A **graph-driven ONNX front end** that runs a whole fp32 model on this backend
-  — field linear layers, Boolean ReLU and pooling, and floating-point
-  BatchNorm/Sigmoid/GeLU — converting between the field and the bit/float world at
-  each layer boundary. This is the current entry point for real models; the three
-  pieces above are the building blocks and the earlier hand-built networks it
-  superseded.
+  and follows Mystique faithfully — field linear layers, Boolean ReLU and pooling,
+  and floating-point BatchNorm/Sigmoid/GeLU — converting between the field and the
+  bit/float world at each layer boundary. Activations live in the fixed-point field,
+  and floating point is used only where it is genuinely required (the per-channel
+  square root inside batch normalization); truncating back to the working scale
+  after each multiply is a field range check rather than a floating-point
+  round-trip. These choices are what make it far cheaper than the naive network.
+  This is the current entry point for real models.
 
 The lesson from this directory is concrete: almost all of the cost is the
 crossing between the arithmetic field and the bit/floating-point world — the

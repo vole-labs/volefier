@@ -15,7 +15,6 @@ the [library README](../../volefier/ml-float/README.md) for the design rationale
 | [`float_nonlinear.cpp`](float_nonlinear.cpp) | standalone float activation / norm / softmax vs a plaintext `double` reference | disabled* |
 | [`float_convert.cpp`](float_convert.cpp) | prototype arith↔float round-trip at one layer boundary (edaBit + Fix↔Float, ReLU in Boolean) | disabled* |
 | [`resnet.cpp`](resnet.cpp) | float-native ResNet (activations carried in float throughout) — the naive baseline, kept for comparison | disabled* |
-| [`field_resnet.cpp`](field_resnet.cpp) | field-native ResNet (activations in the field; float only for the truncation rescale + BatchNorm sqrt) | disabled* |
 
 \* Commented out in [`test/CMakeLists.txt`](../CMakeLists.txt) pending a port to the new emp API; only
 `onnx_infer` and `float_convert_test` are currently built. Re-enable after migrating `volefier/ml-float/*.h`.

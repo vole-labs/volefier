@@ -729,7 +729,12 @@ public:
 //   v'     = v + round(a2_t (round(g^2 / 2^(2Fg-Fv)) - v))      v' in [0, 2^Vb), Fv = 2Fg - 10
 //   s      = round(sqrt(v' 2^2K))                               sqrt(v') at 2^-(Fv/2+K)
 //   r      = round(m' 2^Fr / (s + e))                           m'/(sqrt(v')+eps) at 2^-Fr
-//   theta' = theta - round(r * lr 2^(Ft-Fr)) - round(theta * lr wd)
+//   th'    = th - round(r * lr 2^(Fm-Fr)) - round(th * lr wd)     master copy, 2^-Fm
+//   theta' = round(th' / 2^Fx)                                    working copy, 2^-Ft
+// The optimizer keeps its own master copy th of the parameters at Fm = Ft + Fx fractional bits
+// (default Fx = 16), the working copy theta feeding the model.  One step changes a parameter by
+// about lr (lr wd for the decay, ~1e-5 of theta): at 2^-Ft that is often under one unit and
+// rounds to zero, while at 2^-Fm it accumulates across steps.
 // Fg (default 28) places the window of representable gradient magnitudes, ~[2^-(Fg-5), 2^(29-Fg)),
 // like a loss scale; a gradient past its top makes the proof fail.  Every rescale is
 // FixedInfer::requant_cm; s is proven as in prove_rsqrt (|v' 2^2K - s^2| <= s, exact range
@@ -741,7 +746,7 @@ public:
   FixedInfer *qi;
   RangeCheckLU *rc;
   Div *div;
-  std::size_t Ft, Fin, Fg, Fv, Vb = 48, K, Sb, Fr = 16;
+  std::size_t Ft, Fin, Fg, Fv, Vb = 48, K, Sb, Fr = 16, Fx, Fm;
   double lr, b1, b2, eps, wd;
   uint64_t cu, cw = 0, e;
   std::size_t Mu, Mw = 0;
@@ -751,11 +756,13 @@ public:
 
   FixedAdamW(FixedInfer *qi_, RangeCheckLU *rc_, std::size_t Ft_, std::size_t Fin_, double lr_,
              double b1_ = 0.9, double b2_ = 0.999, double eps_ = 1e-8, double wd_ = 0.01,
-             std::size_t Fg_ = 28)
-      : qi(qi_), rc(rc_), Ft(Ft_), Fin(Fin_), Fg(Fg_), Fv(2 * Fg_ - 10), lr(lr_), b1(b1_), b2(b2_), eps(eps_), wd(wd_) {
+             std::size_t Fg_ = 28, std::size_t Fx_ = 16)
+      : qi(qi_), rc(rc_), Ft(Ft_), Fin(Fin_), Fg(Fg_), Fv(2 * Fg_ - 10), Fx(Fx_), Fm(Ft_ + Fx_), lr(lr_), b1(b1_), b2(b2_), eps(eps_), wd(wd_) {
     K = 29 - (Vb + 1) / 2;   // s < 2^Sb = 2^30, s^2 < 2^60; v' 2^2K < 2^58
     Sb = (Vb + 1) / 2 + K + 1;
-    LoRAAdapter::to_fixed(lr * std::ldexp(1.0, (int)Ft - (int)Fr), cu, Mu);
+    const double xu = lr * std::ldexp(1.0, (int)Fm - (int)Fr);
+    LoRAAdapter::to_fixed(xu, cu, Mu);
+    if ((int64_t)Mu < 1) { Mu = 1; cu = static_cast<uint64_t>(llround(xu * 2)); }   // xu >= 2^9: >= 10 bits at 2^-1
     if (wd > 0) LoRAAdapter::to_fixed(lr * wd, cw, Mw);
     e = std::max<uint64_t>(1, llround(eps * std::ldexp(1.0, (int)(Fv / 2 + K))));
     div = new Div(qi->party, qi->io, Sb + 2);   // divisor s + e, 2(s + e) < 2^(Sb+2)
@@ -771,9 +778,17 @@ public:
     return k;
   }
 
-  // One step on a parameter vector; m and v are updated in place.
-  void step(std::vector<IntFp> &th_new, std::vector<IntFp> &m, std::vector<IntFp> &v,
-            const std::vector<IntFp> &th, const std::vector<IntFp> &raw, double gscale, int t) const {
+  // The initial master copy of theta: exact, th = theta 2^Fx.
+  std::vector<IntFp> master(const std::vector<IntFp> &theta) const {
+    std::vector<IntFp> th(theta.size());
+    for (std::size_t i = 0; i < th.size(); ++i) th[i] = theta[i] * (static_cast<uint64_t>(1) << Fx);
+    return th;
+  }
+
+  // One step on a parameter vector: the master copy th, m and v are updated in place, theta is
+  // set to the new working copy.
+  void step(std::vector<IntFp> &theta, std::vector<IntFp> &th, std::vector<IntFp> &m, std::vector<IntFp> &v,
+            const std::vector<IntFp> &raw, double gscale, int t) const {
     const std::size_t n = th.size();
     const StepConst k = consts(gscale, t);
     std::vector<IntFp> g, d, upd, gsq, sq(n), s(n);
@@ -810,11 +825,11 @@ public:
     for (std::size_t i = 0; i < n; ++i) r[i] = div->round_div(m[i] * (static_cast<uint64_t>(1) << Fr), s[i] + ep_);
     qi->requant_cm(upd, r, cu, Mu);
     if (wd > 0) qi->requant_cm(wdv, th, cw, Mw);
-    th_new.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
-      th_new[i] = th[i] + upd[i].negate();
-      if (wd > 0) th_new[i] = th_new[i] + wdv[i].negate();
+      th[i] = th[i] + upd[i].negate();
+      if (wd > 0) th[i] = th[i] + wdv[i].negate();
     }
+    qi->requant_cm(theta, th, 1, Fx);
   }
 
   static uint64_t round_sqrt(uint64_t X) {
@@ -825,11 +840,11 @@ public:
   }
 
   // Plaintext replay of step() on decoded integers (prover-side checks).
-  void replay(std::vector<int64_t> &th_new, std::vector<int64_t> &m, std::vector<int64_t> &v,
-              const std::vector<int64_t> &th, const std::vector<int64_t> &raw, double gscale, int t) const {
+  void replay(std::vector<int64_t> &theta, std::vector<int64_t> &th, std::vector<int64_t> &m, std::vector<int64_t> &v,
+              const std::vector<int64_t> &raw, double gscale, int t) const {
     const StepConst k = consts(gscale, t);
     auto rhu = [](__int128 N, std::size_t M) { return (int64_t)((N + ((__int128)1 << (M - 1))) >> M); };
-    th_new.resize(th.size());
+    theta.resize(th.size());
     for (std::size_t i = 0; i < th.size(); ++i) {
       const int64_t g = rhu((__int128)raw[i] * k.cg, k.Mg);
       m[i] += rhu((__int128)(g - m[i]) * k.c1, k.M1);
@@ -838,7 +853,8 @@ public:
       const int64_t sd = (int64_t)round_sqrt((uint64_t)v[i] << (2 * K)) + (int64_t)e;
       const int64_t N = m[i] * ((int64_t)1 << Fr);
       const int64_t r = N >= 0 ? (N + sd / 2) / sd : -((-N + sd / 2) / sd);   // Div: half away
-      th_new[i] = th[i] - rhu((__int128)r * cu, Mu) - (wd > 0 ? rhu((__int128)th[i] * cw, Mw) : 0);
+      th[i] -= rhu((__int128)r * cu, Mu) + (wd > 0 ? rhu((__int128)th[i] * cw, Mw) : 0);
+      theta[i] = Fx ? rhu(th[i], Fx) : th[i];
     }
   }
 };

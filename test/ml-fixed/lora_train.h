@@ -32,7 +32,9 @@
 // for SGD, 1e-3 for AdamW), ADAM_B1 / ADAM_B2 / ADAM_EPS / WD (AdamW, default 0.9 / 0.999 /
 // 1e-8 / 0.01), ADAM_GRAD_BITS (fractional bits of the AdamW gradient, default 28: gradients
 // up to 2^(29-bits) in magnitude; gradients only a few units of 2^-bits get coarse AdamW updates,
-// so raise it when the gradients are small -- the random medium model needs ~36), ALPHA (default 2*RANK), LSE (LogSumExp attention
+// so raise it when the gradients are small -- the random medium model needs ~36),
+// ADAM_MASTER_BITS (extra fractional bits of AdamW's master copy of the adapters, default 16),
+// ALPHA (default 2*RANK), LSE (LogSumExp attention
 // softmax, default 1; 0 = the division softmax), HEAD_EXP_BITS (extra output bits of the head's
 // exp table, default 12), ATTN_EXP_BITS (extra output bits of the LSE attention softmax, default
 // 8), GPT2_BIN, TOKENS, CHECK, ZK_THREADS, PEER_IP.
@@ -116,7 +118,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
   const int DH = D / H;
   const double LR = env_d("LR", adamw ? 1e-3 : 1e-2), ALPHA = env_d("ALPHA", 2.0 * R);
   const double AB1 = env_d("ADAM_B1", 0.9), AB2 = env_d("ADAM_B2", 0.999), AEPS = env_d("ADAM_EPS", 1e-8), WD = env_d("WD", 0.01);
-  const size_t AFG = env_i("ADAM_GRAD_BITS", 28);
+  const size_t AFG = env_i("ADAM_GRAD_BITS", 28), AFX = env_i("ADAM_MASTER_BITS", 16);
   const bool CHECK = env_i("CHECK", 1) != 0;
   const char *peer_ip = getenv("PEER_IP") ? getenv("PEER_IP") : "127.0.0.1";
   BoolIO *ios[2] = {nullptr, nullptr};
@@ -167,11 +169,12 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     LMHeadBackward lmb(&qi);
     const double lscale = ALPHA / R, eta = LR / ((double)NBATCH * T), gscale = lscale / ((double)NBATCH * T);
     LoRAAdapter lora(&qi, D, D, R, E, G, lscale, eta); // Q and V adapters share the shape
-    // AdamW on the adapters (master scale 2^-(P+E)) from their raw gradients at 2^-(2P+E+G)
-    FixedAdamW *adam = adamw ? new FixedAdamW(&qi, &rclu, P + E, 2 * P + E + G, LR, AB1, AB2, AEPS, WD, AFG) : nullptr;
+    // AdamW on the adapters (2^-(P+E); its master copy at 2^-(P+E+AFX)) from their raw gradients
+    // at 2^-(2P+E+G)
+    FixedAdamW *adam = adamw ? new FixedAdamW(&qi, &rclu, P + E, 2 * P + E + G, LR, AB1, AB2, AEPS, WD, AFG, AFX) : nullptr;
     if (adam && party == ALICE)
-      printf("[cfg] AdamW: b1 %g b2 %g eps %g wd %g | g at 2^-%zu (|g| < 2^%d), v_hat at 2^-%zu, sqrt(v_hat) at 2^-%zu, eps = %llu at that scale\n",
-             AB1, AB2, AEPS, WD, adam->Fg, 29 - (int)adam->Fg, adam->Fv, adam->Fv / 2 + adam->K, (unsigned long long)adam->e);
+      printf("[cfg] AdamW: b1 %g b2 %g eps %g wd %g | g at 2^-%zu (|g| < 2^%d), v_hat at 2^-%zu, sqrt(v_hat) at 2^-%zu, eps = %llu at that scale | master copy at 2^-%zu\n",
+             AB1, AB2, AEPS, WD, adam->Fg, 29 - (int)adam->Fg, adam->Fv, adam->Fv / 2 + adam->K, (unsigned long long)adam->e, adam->Fm);
     vector<FixedLayerNorm *> ln1(NB), ln2(NB);
     vector<FixedAttention *> attn(NB);
     vector<FixedTransformerBlock *> tblk(NB);
@@ -259,10 +262,14 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
     const IntFp zero(0ULL, PUBLIC);
     vector<vector<IntFp>> Aq(NB), Av(NB), Bq(NB, vector<IntFp>((size_t)D * R, zero)), Bv(NB, vector<IntFp>((size_t)D * R, zero));
     for (int b = 0; b < NB; ++b) { Aq[b] = pubv(A0q[b]); Av[b] = pubv(A0v[b]); }
-    // adapter j of block b: 0 = B_q, 1 = A_q, 2 = B_v, 3 = A_v; AdamW moments start at 0
+    // adapter j of block b: 0 = B_q, 1 = A_q, 2 = B_v, 3 = A_v; AdamW moments start at 0, its
+    // master copies at the initial adapters
     auto prm = [&](int j, int b) -> vector<IntFp> & { return j == 0 ? Bq[b] : j == 1 ? Aq[b] : j == 2 ? Bv[b] : Av[b]; };
-    vector<vector<IntFp>> am[4], av[4];
-    for (int j = 0; j < 4 && adam; ++j) { am[j].resize(NB); av[j].resize(NB); for (int b = 0; b < NB; ++b) { am[j][b].assign(prm(j, b).size(), zero); av[j][b].assign(prm(j, b).size(), zero); } }
+    vector<vector<IntFp>> am[4], av[4], amst[4];
+    for (int j = 0; j < 4 && adam; ++j) {
+      am[j].resize(NB); av[j].resize(NB); amst[j].resize(NB);
+      for (int b = 0; b < NB; ++b) { am[j][b].assign(prm(j, b).size(), zero); av[j][b].assign(prm(j, b).size(), zero); amst[j][b] = adam->master(prm(j, b)); }
+    }
     vector<Mat> cx(NBATCH, Mat(S)), onehot(NBATCH, Mat(T, vector<IntFp>(V)));
     auto commit_onehot = [&](vector<IntFp> &row, int id) {
       vector<uint64_t> raw(V, 0);
@@ -522,7 +529,7 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
 
       // ================= ADAPTER UPDATE (one per step, on the batch-mean loss) =================
       auto to = chrono::steady_clock::now();
-      size_t nzB = 0, nzA = 0, nB = 0, nA = 0;
+      size_t nzB = 0, nzA = 0, nB = 0, nA = 0, nxB = 0, nxA = 0; // nx: AdamW master entries changed
       double hr = 0; // largest |requant input| of the gradient rescale, log2 (must stay < 59)
       double gtop = 0; // largest |AdamW gradient|
       size_t glow = 0, gnz = 0; // nonzero AdamW gradients, and those under 32 units (coarse there)
@@ -571,8 +578,8 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
           vector<int64_t> old[4];   // pre-step adapters (the float gradients use the old B and A)
           if (CHECK && party == ALICE) for (int j = 0; j < 4; ++j) old[j] = dqv(prm(j, b));
           for (int j = 0; j < 4; ++j) {
-            vector<IntFp> &th = prm(j, b), th2;
-            vector<int64_t> th0, m0, v0, rw;
+            vector<IntFp> &th = prm(j, b);
+            vector<int64_t> th0, x0, m0, v0, rw;
             if (party == ALICE) { // the gradient must fit the AdamW window (prover-side, before proving)
               const FixedAdamW::StepConst kc = adam->consts(gscale, step + 1);
               double gmax = 0;
@@ -583,17 +590,19 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
               if (gmax >= std::ldexp(1.0, 29)) error("AdamW: |gradient| exceeds the ADAM_GRAD_BITS window -- lower ADAM_GRAD_BITS\n");
               gtop = max(gtop, gmax / std::ldexp(1.0, (int)adam->Fg));
             }
-            if (CHECK && party == ALICE) { th0 = dqv(th); m0 = dqv(am[j][b]); v0 = dqv(av[j][b]); rw = dqv(raw[j]); }
-            adam->step(th2, am[j][b], av[j][b], th, raw[j], gscale, step + 1);
+            if (CHECK && party == ALICE) { th0 = dqv(th); x0 = dqv(amst[j][b]); m0 = dqv(am[j][b]); v0 = dqv(av[j][b]); rw = dqv(raw[j]); }
+            adam->step(th, amst[j][b], am[j][b], av[j][b], raw[j], gscale, step + 1);
             if (CHECK && party == ALICE) {
               auto tc = chrono::steady_clock::now();
               // exact replay of the whole AdamW step, then the float AdamW update from the float
-              // gradient (its own float moments, the proven old parameters)
-              vector<int64_t> thr, mr = m0, vr = v0;
-              adam->replay(thr, mr, vr, th0, rw, gscale, step + 1);
-              const vector<int64_t> thn = dqv(th2), mn = dqv(am[j][b]), vn = dqv(av[j][b]);
+              // gradient (its own float moments, the proven old master copy); the update compared
+              // is the master copy's
+              vector<int64_t> thr, xr = x0, mr = m0, vr = v0;
+              adam->replay(thr, xr, mr, vr, rw, gscale, step + 1);
+              const vector<int64_t> thn = dqv(th), xn = dqv(amst[j][b]), mn = dqv(am[j][b]), vn = dqv(av[j][b]);
               size_t bad = 0;
-              for (size_t i = 0; i < th0.size(); ++i) bad += (thn[i] != thr[i]) + (mn[i] != mr[i]) + (vn[i] != vr[i]);
+              for (size_t i = 0; i < th0.size(); ++i) bad += (thn[i] != thr[i]) + (xn[i] != xr[i]) + (mn[i] != mr[i]) + (vn[i] != vr[i]);
+              const double XS = std::ldexp(1.0, (int)adam->Fm);
               const FixedAdamW::StepConst kc = adam->consts(gscale, step + 1);
               for (int64_t x : rw) hr = max(hr, log2(fabs((double)x) * kc.cg + 1));
               // float gradient of this adapter from the float dL/dW_eff sum
@@ -611,13 +620,14 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
                 g *= gscale;
                 fm[j][b][t] = AB1 * fm[j][b][t] + (1 - AB1) * g;
                 fv[j][b][t] = AB2 * fv[j][b][t] + (1 - AB2) * g * g;
-                uf[t] = LR * ((fm[j][b][t] / bc1) / (sqrt(fv[j][b][t] / bc2) + AEPS) + WD * th0[t] / MS);
+                uf[t] = LR * ((fm[j][b][t] / bc1) / (sqrt(fv[j][b][t] / bc2) + AEPS) + WD * x0[t] / XS);
                 const double gp = rw[t] * gp_s;
                 pm[j][b][t] = AB1 * pm[j][b][t] + (1 - AB1) * gp;
                 pv[j][b][t] = AB2 * pv[j][b][t] + (1 - AB2) * gp * gp;
-                ug[t] = LR * ((pm[j][b][t] / bc1) / (sqrt(pv[j][b][t] / bc2) + AEPS) + WD * th0[t] / MS);
-                up[t] = (th0[t] - thn[t]) / MS;
+                ug[t] = LR * ((pm[j][b][t] / bc1) / (sqrt(pv[j][b][t] / bc2) + AEPS) + WD * x0[t] / XS);
+                up[t] = (x0[t] - xn[t]) / XS;
                 (isB ? nzB : nzA) += thn[t] != th0[t];
+                (isB ? nxB : nxA) += xn[t] != x0[t];
               }
               (isB ? nB : nA) += th0.size();
               printf("[1]   blk%-2d adapter %c%c: AdamW exact replay %zu mismatches | cos(update, float AdamW on proven grad) %.5f | cos(update, float update) %.4f\n",
@@ -625,7 +635,6 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
               if (bad) ok = false;
               chk_s += secs(tc);
             }
-            th = std::move(th2);
           }
         }
       }
@@ -633,7 +642,8 @@ static int lora_train_main(int argc, char **argv, LoraCfg c, const char *name) {
       if (CHECK && party == ALICE)
         printf("[1] step %d  adapter entries changed: B %zu/%zu (%.1f%%)  A %zu/%zu (%.1f%%) | gradient rescale input up to 2^%.1f (limit 2^59)%s\n",
                step, nzB, nB, 100.0 * nzB / nB, nzA, nA, 100.0 * nzA / nA, hr,
-               adam ? (" | max |g| " + to_string(gtop) + ", " + to_string(gnz ? 100.0 * glow / gnz : 0.0) +
+               adam ? (" | master copy changed: B " + to_string(nB ? 100.0 * nxB / nB : 0.0) + "%  A " + to_string(nA ? 100.0 * nxA / nA : 0.0) +
+                       "% | max |g| " + to_string(gtop) + ", " + to_string(gnz ? 100.0 * glow / gnz : 0.0) +
                        "% of gradients under 32 units (raise ADAM_GRAD_BITS if large)").c_str() : "");
       printf("[%d] step %d done: W_eff+forward %.1fs, head %.1fs, backward %.1fs, %s %.1fs (wall incl. prover checks)\n",
              party, step, t_fwd, t_head, t_bwd, adam ? "AdamW" : "SGD", t_opt);

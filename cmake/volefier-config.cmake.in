@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(NOT TARGET emp-zk::emp-zk)
+  find_dependency(emp-zk 1.0)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/volefierTargets.cmake")
+
+check_required_components(volefier)

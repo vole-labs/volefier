@@ -43,6 +43,28 @@ rebuilding.
 
 Executables land in `build/bin/test_<folder>_<name>`.
 
+### Using volefier from another project
+
+volefier is header-only and exports the CMake target `volefier::volefier` (include root plus
+`emp-zk::emp-zk`). Install it next to the back-end and consume it with `find_package`:
+
+```bash
+cmake --install build --prefix "$PWD/external/install"     # headers + volefier-config.cmake
+```
+
+```cmake
+find_package(volefier 0.1 REQUIRED)       # CMAKE_PREFIX_PATH must also reach emp-zk's prefix
+target_link_libraries(my_app PRIVATE volefier::volefier)
+```
+
+```cpp
+#include "volefier/ml-fixed/fixed_infer.h"
+```
+
+Without installing, point `volefier_DIR` at the build tree, or `add_subdirectory` the checkout
+(tests are built only when volefier is the top-level project; `VOLEFIER_BUILD_TESTS` /
+`VOLEFIER_INSTALL` override).
+
 ---
 
 ## Running

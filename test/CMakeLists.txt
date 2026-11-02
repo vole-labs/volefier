@@ -4,19 +4,20 @@
 macro (add_test_executable_with_lib folder _name)
 	string(REPLACE "/" "_" _tgt "test_${folder}_${_name}")
 	add_executable(${_tgt} "${folder}/${_name}.cpp")
-	target_link_libraries(${_tgt} ${EMP-ZK_LIBRARIES})
+	target_link_libraries(${_tgt} volefier::volefier)
+	target_include_directories(${_tgt} PRIVATE ${PROJECT_SOURCE_DIR})   # test-local "test/..." headers
 endmacro()
 
 macro (add_test_case folder _name)
 	add_test_executable_with_lib(${folder} ${_name})
 	string(REPLACE "/" "_" _tgt "test_${folder}_${_name}")
-  	add_test(NAME ${folder}_${_name} COMMAND "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${_tgt}" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/")
+  	add_test(NAME ${folder}_${_name} COMMAND "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${_tgt}" WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/")
 endmacro()
 
 macro (add_test_case_with_run folder _name)
 	add_test_executable_with_lib(${folder} ${_name})
 	string(REPLACE "/" "_" _tgt "test_${folder}_${_name}")
-	add_test(NAME ${folder}_${_name} COMMAND "./run" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${_tgt}" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/")
+	add_test(NAME ${folder}_${_name} COMMAND "./run" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${_tgt}" WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/")
 
 endmacro()
 

@@ -29,7 +29,7 @@ struct BenchE2E {
   IO **ios;
   int n;
   bool on;
-  std::chrono::time_point<std::chrono::high_resolution_clock> t0;
+  decltype(emp::clock_start()) t0;
   uint64_t b0;
 
   BenchE2E(int party_, IO **ios_, int n_)

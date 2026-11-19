@@ -30,7 +30,7 @@ static int64_t rcm(int64_t acc, int64_t c, int M) {   // matches requant_cm: rou
 }
 
 static PRG *gprg;
-static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
+static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data_unaligned(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
 
 int main(int argc, char **argv) {
   parse_party_and_port(argv, &party, &port);

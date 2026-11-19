@@ -65,7 +65,7 @@ public:
   int64_t rnd(int64_t lo, int64_t hi) {
     if (party != ALICE) return 0;
     uint64_t r;
-    prg->random_data(&r, sizeof(r));
+    prg->random_data_unaligned(&r, sizeof(r));
     return lo + (int64_t)(r % (uint64_t)(hi - lo + 1));
   }
   static int64_t rcm(int64_t acc, int64_t c, int M) {   // FixedInfer::requant_cm: round-half-up

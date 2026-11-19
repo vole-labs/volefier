@@ -40,8 +40,8 @@ void run(BoolIO *ios[threads], int party) {
   vector<vector<int64_t>> W(n, vector<int64_t>(m));
   vector<int64_t> x(m);
   if (party == ALICE) {
-    for (auto &row : W) for (auto &w : row) { uint64_t r; prg.random_data(&r, sizeof(r)); w = (int64_t)(r % 9) - 4; }
-    for (auto &v : x) { uint64_t r; prg.random_data(&r, sizeof(r)); v = (int64_t)(r % 9) - 4; }
+    for (auto &row : W) for (auto &w : row) { uint64_t r; prg.random_data_unaligned(&r, sizeof(r)); w = (int64_t)(r % 9) - 4; }
+    for (auto &v : x) { uint64_t r; prg.random_data_unaligned(&r, sizeof(r)); v = (int64_t)(r % 9) - 4; }
   }
   vector<vector<IntFp>> cW(n, vector<IntFp>(m));
   vector<IntFp> cx(m);

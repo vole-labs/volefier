@@ -34,7 +34,7 @@ static PRG *gprg;
 static int party_g;
 static int64_t rnd(int64_t lo, int64_t hi) {
   if (party_g != ALICE) return 0;
-  uint64_t r; gprg->random_data(&r, sizeof(r));
+  uint64_t r; gprg->random_data_unaligned(&r, sizeof(r));
   return lo + (int64_t)(r % (uint64_t)(hi - lo + 1));
 }
 

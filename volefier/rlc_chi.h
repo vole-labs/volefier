@@ -28,7 +28,7 @@ static constexpr int64_t kChiBlk = 4096;
 inline void prg_chi_block(uint64_t seed, uint64_t blk, uint64_t *w /* kChiBlk */) {
   emp::block sb = emp::makeBlock(seed ^ 0x9e3779b97f4a7c15ULL, blk);
   emp::PRG prg(&sb);
-  prg.random_data(w, (int)(kChiBlk * 8));
+  prg.random_data_unaligned(w, (int)(kChiBlk * 8));
   for (int64_t j = 0; j < kChiBlk; ++j) w[j] = emp::mod(w[j]);
 }
 

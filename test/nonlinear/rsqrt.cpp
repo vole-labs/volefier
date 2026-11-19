@@ -34,10 +34,10 @@ int main(int argc, char **argv) {
   for (size_t k = 0; k < TESTS; ++k) {
     uint64_t v = 1;
     if (party == ALICE) {   // log-uniform var over [1, 2^VB), plus the edge values
-      uint64_t r; prg.random_data(&r, sizeof(r));
+      uint64_t r; prg.random_data_unaligned(&r, sizeof(r));
       if (k == 0) v = 1;
       else if (k == 1) v = (1ULL << VB) - 1;
-      else { int b = 1 + (int)(r % VB); prg.random_data(&r, sizeof(r)); v = (r & ((1ULL << b) - 1)) | (1ULL << (b - 1)); }
+      else { int b = 1 + (int)(r % VB); prg.random_data_unaligned(&r, sizeof(r)); v = (r & ((1ULL << b) - 1)) | (1ULL << (b - 1)); }
     }
     IntFp var(party == ALICE ? v : 0ULL, ALICE);
     IntFp dinv = prove_rsqrt(&rc, party, var, P, VB);

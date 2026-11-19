@@ -42,7 +42,7 @@ const int64_t  RELU_OFF = 512;       // ReLU table index offset
 // Small signed quantized weight in [-2^(b-1), 2^(b-1)-1]; here b=4 -> [-8,7].
 static int64_t rand_q(PRG &prg) {
   uint64_t r;
-  prg.random_data(&r, sizeof(r));
+  prg.random_data_unaligned(&r, sizeof(r));
   return static_cast<int64_t>(r & 0xF) - 8;   // [-8, 7]
 }
 

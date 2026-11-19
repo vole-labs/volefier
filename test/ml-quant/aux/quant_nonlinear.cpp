@@ -40,7 +40,7 @@ static int64_t rcm(int64_t acc, int64_t c, int M) {          // matches requant_
 }
 
 static int64_t rng(PRG &prg, int64_t lo, int64_t hi) {
-  uint64_t r; prg.random_data(&r, sizeof(r));
+  uint64_t r; prg.random_data_unaligned(&r, sizeof(r));
   return lo + static_cast<int64_t>(r % static_cast<uint64_t>(hi - lo + 1));
 }
 

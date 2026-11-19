@@ -51,7 +51,7 @@ public:
   double rnd(double lo, double hi) {
     if (party != ALICE) return 0.0;
     uint64_t r;
-    prg->random_data(&r, sizeof(r));
+    prg->random_data_unaligned(&r, sizeof(r));
     return lo + (hi - lo) * ((double)(r >> 11) / (double)(1ULL << 53));
   }
   // He-style fan-in scaled weight init: keeps per-layer gain ~1 so activations

@@ -38,8 +38,8 @@ void run(BoolIO *ios[threads], int party) {
                M    = getenv("MM")   ? atol(getenv("MM"))   : 256;
   vector<vector<int64_t>> K(Cout, vector<int64_t>(M)), X(Pn, vector<int64_t>(M));
   if (party == ALICE) {
-    for (auto &r : K) for (auto &w : r) { uint64_t t; prg.random_data(&t, 8); w = (int64_t)(t % 9) - 4; }
-    for (auto &r : X) for (auto &w : r) { uint64_t t; prg.random_data(&t, 8); w = (int64_t)(t % 9) - 4; }
+    for (auto &r : K) for (auto &w : r) { uint64_t t; prg.random_data_unaligned(&t, 8); w = (int64_t)(t % 9) - 4; }
+    for (auto &r : X) for (auto &w : r) { uint64_t t; prg.random_data_unaligned(&t, 8); w = (int64_t)(t % 9) - 4; }
   }
   vector<vector<IntFp>> cK(Cout, vector<IntFp>(M)), cX(Pn, vector<IntFp>(M));
   for (size_t i = 0; i < Cout; ++i) for (size_t k = 0; k < M; ++k) cK[i][k] = commit_s(K[i][k], party);
@@ -78,8 +78,8 @@ void run(BoolIO *ios[threads], int party) {
   const size_t G = 6, AM = 48, AN = 48, AK = 32;
   vector<int64_t> Af(G * AM * AK), Bf(G * AK * AN);
   if (party == ALICE) {
-    for (auto &w : Af) { uint64_t t; prg.random_data(&t, 8); w = (int64_t)(t % 7) - 3; }
-    for (auto &w : Bf) { uint64_t t; prg.random_data(&t, 8); w = (int64_t)(t % 7) - 3; }
+    for (auto &w : Af) { uint64_t t; prg.random_data_unaligned(&t, 8); w = (int64_t)(t % 7) - 3; }
+    for (auto &w : Bf) { uint64_t t; prg.random_data_unaligned(&t, 8); w = (int64_t)(t % 7) - 3; }
   }
   vector<IntFp> cAf(G * AM * AK), cBf(G * AK * AN);
   for (size_t i = 0; i < cAf.size(); ++i) cAf[i] = commit_s(Af[i], party);

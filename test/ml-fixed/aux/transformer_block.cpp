@@ -100,7 +100,7 @@ static RMat r_attention(const RMat &Hs,
 
 // ---- random committed helpers (meaningful on ALICE) ----
 static PRG *gprg;
-static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
+static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data_unaligned(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
 static Vec rvec(size_t n, int64_t lo, int64_t hi) { Vec v(n); for (auto &e : v) e = rnd(lo, hi); return v; }
 static RMat rmat(size_t r, size_t c, int64_t lo, int64_t hi) { RMat m(r); for (auto &row : m) row = rvec(c, lo, hi); return m; }
 

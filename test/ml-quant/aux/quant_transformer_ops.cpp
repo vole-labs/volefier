@@ -38,7 +38,7 @@ int main(int argc, char **argv){
     QuantGraphInfer gi(&qi, &cmp, &divr, party);
     gi.P=P; gi.rcmp=&rclu; gi.exp_tab=&expt; gi.gelu_tab=&gtab; gi.gelu_off=GELU_OFF; gi.score_bits=16;
     vector<int64_t> xr(S*D, 0);
-    if(party==ALICE){ for(auto&v:xr){ uint64_t t; prg.random_data(&t,8); v=(int64_t)(t%2000)-1000; } }   // @2^-12
+    if(party==ALICE){ for(auto&v:xr){ uint64_t t; prg.random_data_unaligned(&t,8); v=(int64_t)(t%2000)-1000; } }   // @2^-12
     vector<IntFp> cx; qi.commit_vec(cx, xr);
     vector<int64_t> oref; vector<IntFp> out = gi.run(g, cx, xr, 1.0/(1<<P), 0, oref);
     for(auto&e:out) e.reveal();

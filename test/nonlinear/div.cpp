@@ -43,9 +43,9 @@ int main(int argc, char **argv) {
   for (size_t k = 0; k < TESTS; ++k) {
     int64_t Nv = 0, Dv = 1;
     if (party == ALICE) {
-      uint64_t r; prg.random_data(&r, sizeof(r));
+      uint64_t r; prg.random_data_unaligned(&r, sizeof(r));
       Nv = (int64_t)(r % 200001) - 100000;   // N in [-100000, 100000]
-      prg.random_data(&r, sizeof(r));
+      prg.random_data_unaligned(&r, sizeof(r));
       Dv = (int64_t)(r % 1000) + 1;           // D in [1, 1000]
     }
     IntFp N = IntFp(party == ALICE ? (Nv >= 0 ? (uint64_t)Nv : (uint64_t)(Nv + (int64_t)PR)) : 0ULL, ALICE);

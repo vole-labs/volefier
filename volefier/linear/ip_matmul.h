@@ -306,7 +306,7 @@ public:
     block sblk = makeBlock(seed, 0x9e3779b97f4a7c15ULL);
     PRG prg(&sblk);
     std::vector<uint64_t> r((std::size_t)(nu + nv));
-    prg.random_data(r.data(), (std::size_t)(nu + nv) * sizeof(uint64_t));
+    prg.random_data_unaligned(r.data(), (std::size_t)(nu + nv) * sizeof(uint64_t));
     for (int i = 0; i < nu; ++i) u[(std::size_t)i] = mod(r[(std::size_t)i]);
     for (int i = 0; i < nv; ++i) v[(std::size_t)i] = mod(r[(std::size_t)(nu + i)]);
   }
@@ -426,8 +426,8 @@ public:
       std::vector<uint64_t> u(Cout), v(Pn);
       block sblk = makeBlock(seed ^ 0x9e3779b97f4a7c15ULL, (uint64_t)q + 1);   // per-job nonce
       PRG prg(&sblk);
-      prg.random_data(u.data(), (int)(Cout * sizeof(uint64_t)));
-      prg.random_data(v.data(), (int)(Pn * sizeof(uint64_t)));
+      prg.random_data_unaligned(u.data(), (int)(Cout * sizeof(uint64_t)));
+      prg.random_data_unaligned(v.data(), (int)(Pn * sizeof(uint64_t)));
       for (auto &e : u) e = mod(e);
       for (auto &e : v) e = mod(e);
       fv_fold(j.kernel, j.cols, j.C, u, v, fv_threads_);

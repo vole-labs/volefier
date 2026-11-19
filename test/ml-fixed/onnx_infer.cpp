@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
 
   // commit a random input vector (scale 2^P)
   vector<int64_t> xr(in_dim, 0);
-  if (party == ALICE) { PRG prg; for (auto &v : xr) { uint64_t t; prg.random_data(&t, 8); v = (int64_t)(t % 200) - 100; } }   // small (no real input image)
+  if (party == ALICE) { PRG prg; for (auto &v : xr) { uint64_t t; prg.random_data_unaligned(&t, 8); v = (int64_t)(t % 200) - 100; } }   // small (no real input image)
   if (party == ALICE) { const char *ip = getenv("INPUT_F32"); if (ip) { FILE *f = fopen(ip, "rb"); vector<float> fb(in_dim); size_t rd = fread(fb.data(), 4, in_dim, f); fclose(f); for (int i = 0; i < in_dim && i < (int)rd; ++i) xr[i] = llround((double)fb[i] * (1 << P)); cout << "loaded real input (" << rd << " vals) from " << ip << endl; } }
   vector<IntFp> cx; qi.commit_vec(cx, xr);
 

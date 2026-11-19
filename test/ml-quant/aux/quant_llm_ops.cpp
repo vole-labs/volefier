@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     RangeCheckLU rclu(party, ios[0]->io, 16); CompareLU cmp(&rclu); Div divr(party, ios[0]->io, 16);
     const uint64_t ST = 1u << 16; const int64_t SOFF = 1 << 15;
     QuantTable silut(ST, party, ios[0]->io); silut.Setup(build_silu_table(ST, P, SOFF));
-    auto fill = [&](vector<int64_t> &v, int64_t lo, int64_t hi) { if (party == ALICE) for (auto &x : v) { uint64_t t; prg.random_data(&t, 8); x = lo + (int64_t)(t % (uint64_t)(hi - lo + 1)); } };
+    auto fill = [&](vector<int64_t> &v, int64_t lo, int64_t hi) { if (party == ALICE) for (auto &x : v) { uint64_t t; prg.random_data_unaligned(&t, 8); x = lo + (int64_t)(t % (uint64_t)(hi - lo + 1)); } };
     // Collect (name, committed output, plaintext ref); compute ALL gadgets first, then reveal once
     // at the end (matches the working pattern -- no reveals interleaved with later computation).
     vector<string> names; vector<vector<IntFp>> outs; vector<vector<int64_t>> refs;

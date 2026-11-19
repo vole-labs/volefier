@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
   cout << endl << "----- graph-prover op handlers (synthetic ResNet block + transformer ops) -----" << endl << endl;
 
   block seed = makeBlock(0, 1234); PRG prg(&seed);                         // deterministic weights on both parties
-  auto rf = [&](int n, float s) { vector<float> v(n); for (auto &x : v) { uint64_t r; prg.random_data(&r, 8); x = s * (2.f * (float)(r >> 40) / (float)(1 << 24) - 1.f); } return v; };
+  auto rf = [&](int n, float s) { vector<float> v(n); for (auto &x : v) { uint64_t r; prg.random_data_unaligned(&r, 8); x = s * (2.f * (float)(r >> 40) / (float)(1 << 24) - 1.f); } return v; };
   auto mk = [](vector<int64_t> dims, vector<float> d) { OnnxTensor t; t.dtype = 1; t.dims = dims; t.data = std::move(d); return t; };
 
   // ---------- graph A: ResNet-style block ----------
@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
   A.initializer["cw"] = mk({C, C, 3, 3}, rf(C * C * 9, 0.15f));  A.initializer["cb"] = mk({C}, rf(C, 0.05f));
   A.initializer["bs"] = mk({C}, rf(C, 0.2f));                    A.initializer["bb"] = mk({C}, rf(C, 0.1f));
   A.initializer["bm"] = mk({C}, rf(C, 0.1f));
-  { vector<float> var(C); for (auto &v : var) { uint64_t r; prg.random_data(&r, 8); v = 0.5f + (float)(r >> 40) / (float)(1 << 24); } A.initializer["bv"] = mk({C}, var); }  // var > 0
+  { vector<float> var(C); for (auto &v : var) { uint64_t r; prg.random_data_unaligned(&r, 8); v = 0.5f + (float)(r >> 40) / (float)(1 << 24); } A.initializer["bv"] = mk({C}, var); }  // var > 0
   A.initializer["fw"] = mk({3, C}, rf(3 * C, 0.2f));             A.initializer["fb"] = mk({3}, rf(3, 0.05f));
   { OnnxNode c = nd("Conv", {"x", "cw", "cb"}, {"c"}); ai(c, "strides", 1); ai(c, "pads", 1); A.nodes.push_back(c); }
   { OnnxNode b = nd("BatchNormalization", {"c", "bs", "bb", "bm", "bv"}, {"bn"}); af(b, "epsilon", 1e-5f); A.nodes.push_back(b); }
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
   auto run_graph = [&](OnnxGraph &g, const char *name, bool exact) {
     int n_in = 1; for (size_t i = 1; i < g.input_shapes[g.inputs[0]].size(); ++i) n_in *= (int)g.input_shapes[g.inputs[0]][i];
     vector<int64_t> xr(n_in, 0);
-    if (party == ALICE) { for (auto &v : xr) { uint64_t t; prg.random_data(&t, 8); v = (int64_t)(t % 600) - 300; } }
+    if (party == ALICE) { for (auto &v : xr) { uint64_t t; prg.random_data_unaligned(&t, 8); v = (int64_t)(t % 600) - 300; } }
     vector<IntFp> cx; qi.commit_vec(cx, xr);
     FixedGraphInfer g2(&qi, &cmp, party, P); g2.divr = &divr; g2.rcmp = &rcmp; g2.exp_tab = &expt; g2.gelu_tab = &gtab; g2.gelu_off = GELU_OFF; g2.sig_tab = &sigt; g2.sig_off = SIG_OFF;
     vector<int64_t> oref; vector<IntFp> out = g2.run(g, cx, xr, oref);

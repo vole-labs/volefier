@@ -69,7 +69,7 @@ public:
             io->recv_data(c_raw.data(), K * sizeof(uint64_t));
         } else {
             PRG prg;
-            prg.random_data(c_raw.data(), K * sizeof(uint64_t));
+            prg.random_data_unaligned(c_raw.data(), K * sizeof(uint64_t));
             for (std::size_t k = 0; k < K; ++k) c_raw[k] = mod(c_raw[k]);
             io->send_data(c_raw.data(), K * sizeof(uint64_t)); io->flush();
         }

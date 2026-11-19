@@ -31,7 +31,7 @@ static int64_t rounddiv(int64_t N, int64_t D) {       // matches Div::round_div
 }
 
 static PRG *gprg;
-static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
+static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data_unaligned(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
 static int64_t dec(uint64_t v) { return QuantInfer::decode_signed(v); }
 
 void run(BoolIO *ios[threads], int party) {

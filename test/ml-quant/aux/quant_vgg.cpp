@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
 
   VGGCfg cfg = vgg_cfg(depth, base, fc_dim, classes, in_hw, bn);
 
-  auto rndv = [&](int64_t lo, int64_t hi) -> int64_t { if (party != ALICE) return 0; uint64_t r; prg.random_data(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); };
+  auto rndv = [&](int64_t lo, int64_t hi) -> int64_t { if (party != ALICE) return 0; uint64_t r; prg.random_data_unaligned(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); };
   St input; input.C = 3; input.H = in_hw; input.W = in_hw;
   input.X.assign(3, vector<vector<IntFp>>(in_hw, vector<IntFp>(in_hw)));
   if (party == ALICE) input.Xr.assign(3, vector<vector<int64_t>>(in_hw, vector<int64_t>(in_hw)));

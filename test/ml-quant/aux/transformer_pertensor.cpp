@@ -28,7 +28,7 @@ const int P = 12;
 static int64_t rcm(int64_t acc, int64_t c, int M) { int64_t N = acc*c, h = (int64_t)1<<(M-1), D = (int64_t)1<<M; return N>=0?(N+h)/D:-(((-N)+h)/D); }
 static int64_t rdiv(int64_t N, int64_t D) { return N>=0?(N+D/2)/D:-(((-N)+D/2)/D); }
 static PRG *gprg;
-static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
+static int64_t rnd(int64_t lo, int64_t hi) { if (party != ALICE) return 0; uint64_t r; gprg->random_data_unaligned(&r, sizeof(r)); return lo + (int64_t)(r % (uint64_t)(hi - lo + 1)); }
 
 int main(int argc, char **argv) {
   parse_party_and_port(argv, &party, &port);

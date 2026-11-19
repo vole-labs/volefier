@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     QuantTable clampt(1u<<16, party, ios[0]->io); clampt.Setup(build_clamp_table(1u<<16, 1<<15, 0, 255));
     if (getenv("USE_CLAMP_LUT")) { gi.clamp_tab = &clampt; gi.clamp_off = 1<<15; }   // opt-in: pre-clamp values must fit +-2^15. Works on WELL-CALIBRATED nets (imagenet-calib ResNet-50: QuantizeLinear 18.3->3.1s, total -40%, comm -55%, bit-exact); only the SYNTHETIC-calib default resnet50-v1-7-qdq.onnx overflows 2^15 (bad scales).
     vector<int64_t> xr(in_dim, 0);
-    if (party == ALICE) { PRG prg; for (auto &v : xr) { uint64_t t; prg.random_data(&t, 8); v = (int64_t)(t % 256); } }
+    if (party == ALICE) { PRG prg; for (auto &v : xr) { uint64_t t; prg.random_data_unaligned(&t, 8); v = (int64_t)(t % 256); } }
     if (party == ALICE) { const char *ip = getenv("INPUT_F32"); if (ip) { FILE *f = fopen(ip, "rb"); vector<float> fb(in_dim); size_t rd = fread(fb.data(), 4, in_dim, f); fclose(f); for (int i = 0; i < in_dim && i < (int)rd; ++i) { long q = lround((double)fb[i] / in_scale) + in_zp; xr[i] = q < 0 ? 0 : (q > 255 ? 255 : q); } cout << "loaded real input (" << rd << " vals) from " << ip << "\n"; } }
     vector<IntFp> cx; qi.commit_vec(cx, xr);
     auto t0 = clock_start();
